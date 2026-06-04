@@ -6,3 +6,5 @@ numpy>=1.24
 pystray>=0.19
 Pillow>=10.0
 anthropic>=0.40
+customtkinter>=5.2
+pywinstyles>=1.8

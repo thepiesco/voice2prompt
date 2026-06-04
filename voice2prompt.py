@@ -27,6 +27,11 @@ import keyboard          # nur fuer keyboard.send("ctrl+v") — Paste-Senden
 import pyperclip
 import tkinter as tk
 from tkinter import ttk
+import customtkinter as ctk
+try:
+    import pywinstyles
+except ImportError:
+    pywinstyles = None
 from PIL import Image, ImageDraw
 import pystray
 from faster_whisper import WhisperModel
@@ -130,261 +135,96 @@ VK_SPACE        = 0x20
 WM_HOTKEY       = 0x0312
 HOTKEY_ID_REC   = 1   # Strg+Leertaste = Aufnahme (einziger Hotkey)
 
-# ---------- Overlay (Tkinter, top-of-screen) ----------
-OV_W, OV_H = 560, 140
-OV_RADIUS  = 26
-TRANSPARENT_KEY = "#010203"
-mode_var_ref = {"v": None}
+# ---------- Overlay (CustomTkinter, native Acrylic via pywinstyles) ----------
+OV_W, OV_H = 560, 138
 pulse_phase  = {"p": 0}
 
-def _rounded_rect(c: tk.Canvas, x1, y1, x2, y2, r, **kw):
-    """Smooth abgerundetes Rechteck via Polygon-Trick."""
-    pts = [
-        x1+r, y1,  x2-r, y1,  x2, y1,
-        x2, y1+r,  x2, y2-r,  x2, y2,
-        x2-r, y2,  x1+r, y2,  x1, y2,
-        x1, y2-r,  x1, y1+r,  x1, y1,
-    ]
-    return c.create_polygon(pts, smooth=True, splinesteps=24, **kw)
+# CTk-Widget-Referenzen
+ctk_refs = {
+    "shell": None,        # outer CTkFrame (border + accent)
+    "header": None,       # header CTkFrame
+    "body": None,         # status-body CTkFrame
+    "name_lbl": None,     # "◆ AIbersetzer"
+    "subtitle": None,     # "Sprache → Text"
+    "mode_btn": None,     # CTkOptionMenu
+    "status_dot": None,   # CTkLabel mit ● dot
+    "status_main": None,  # main status text
+    "status_sub": None,   # sub status text
+}
 
-def draw_pill_button() -> None:
-    """Zeichnet den Mode-Picker-Pill rechts oben — ersetzt die Combobox."""
-    c = canvas_ref["c"]
-    if not c: return
-    c.delete("pill")
-    accent = MODE_COLORS.get(polish_mode, "#777")
-    label = MODE_SHORT.get(polish_mode, polish_mode)
+ctk.set_appearance_mode("dark")
 
-    pw, ph = 190, 32
-    x2 = OV_W - 16
-    y_center = 30
-    x1 = x2 - pw
-    y1, y2 = y_center - ph//2, y_center + ph//2
+# (Old legacy pill-button popup removed — CTkOptionMenu uebernimmt das nativ.)
 
-    # Schatten (leichter Versatz)
-    _rounded_rect(c, x1+1, y1+2, x2+1, y2+2, ph//2, fill="#000000", outline="",
-                  tags="pill")
-    # Pill body
-    _rounded_rect(c, x1, y1, x2, y2, ph//2, fill="#1a1f2a", outline=accent, width=1,
-                  tags=("pill", "pill_body"))
-    # Akzent-Dot links
-    c.create_oval(x1+10, y_center-6, x1+22, y_center+6,
-                  fill=accent, outline="", tags="pill")
-    # Label
-    c.create_text(x1+30, y_center, text=label, anchor="w",
-                  fill="#e8ecf3",
-                  font=("Segoe UI Semibold", 10), tags="pill")
-    # Pfeil
-    c.create_text(x2-14, y_center-1, text="▾", anchor="e",
-                  fill=accent, font=("Segoe UI", 13), tags="pill")
+STATUS_COLORS = {
+    "boot":  ("#7a8290",  "#10151c"),  # text, frame border
+    "idle":  ("#e8ecf3",  "#2a3548"),
+    "rec":   ("#ffffff",  "#ff3854"),
+    "tx":    ("#ffffff",  "#00e5ff"),
+    "done":  ("#e8fff0",  "#6dff8a"),
+    "err":   ("#ffffff",  "#ff8a3d"),
+}
 
-    c.tag_bind("pill", "<Button-1>", lambda e: show_mode_picker())
-    c.tag_bind("pill", "<Enter>",   lambda e: c.config(cursor="hand2"))
-    c.tag_bind("pill", "<Leave>",   lambda e: c.config(cursor=""))
-
-mode_picker_ref = {"p": None}
-
-def show_mode_picker() -> None:
-    """Oeffnet ein abgerundetes Popup mit der Mode-Liste — schoener als
-    ttk.Combobox unter Tkinter."""
-    root = root_ref["r"]
-    if not root: return
-    existing = mode_picker_ref["p"]
-    if existing:
-        try: existing.destroy()
-        except Exception: pass
-        mode_picker_ref["p"] = None
-        return
-
-    item_h = 36
-    pad = 10
-    w = 320
-    h = pad*2 + item_h * len(MODE_ORDER)
-
-    # Position: rechts unter dem Pill-Button
-    px = root.winfo_x() + OV_W - 16 - w
-    py = root.winfo_y() + 48
-
-    popup = tk.Toplevel(root)
-    popup.overrideredirect(True)
-    popup.attributes("-topmost", True)
-    try: popup.attributes("-transparentcolor", TRANSPARENT_KEY)
-    except Exception: pass
-    popup.configure(bg=TRANSPARENT_KEY)
-    popup.geometry(f"{w}x{h}+{px}+{py}")
-    mode_picker_ref["p"] = popup
-
-    pc = tk.Canvas(popup, width=w, height=h, bg=TRANSPARENT_KEY,
-                   highlightthickness=0, bd=0)
-    pc.pack(fill="both", expand=True)
-
-    # Shadow + Body
-    _rounded_rect(pc, 3, 5, w-1, h, 16, fill="#000000", outline="")
-    _rounded_rect(pc, 2, 3, w-1, h-1, 16, fill="#0d1219", outline="#2a3548", width=1)
-    # Inner highlight
-    _rounded_rect(pc, 2, 3, w-1, 24, 16, fill="#161d27", outline="")
-
-    def close():
-        try: popup.destroy()
-        except Exception: pass
-        mode_picker_ref["p"] = None
-
-    for i, m in enumerate(MODE_ORDER):
-        y = pad + i * item_h
-        is_active = (m == polish_mode)
-        col = MODE_COLORS.get(m, "#777")
-        tag = f"item_{m}"
-        # Hintergrund-Highlight bei aktivem Modus
-        if is_active:
-            _rounded_rect(pc, 8, y+2, w-8, y+item_h-2, 8,
-                          fill="#1d2530", outline=col, width=1, tags=tag)
-        # Mode-Color dot
-        pc.create_oval(20, y+item_h//2-6, 32, y+item_h//2+6,
-                       fill=col, outline="#fff" if is_active else "", width=1, tags=tag)
-        # Label
-        pc.create_text(44, y+item_h//2, text=MODE_LABELS[m], anchor="w",
-                       fill="#e8ecf3" if is_active else "#b0b8c5",
-                       font=("Segoe UI Semibold" if is_active else "Segoe UI", 10),
-                       tags=tag)
-        # Klick-Hit-Area
-        hit = pc.create_rectangle(4, y, w-4, y+item_h, fill="", outline="",
-                                    tags=(tag, f"hit_{m}"))
-
-        def make_click(mode_key):
-            def on_click(_e):
-                set_mode(mode_key)
-                draw_pill_button()
-                overlay_set_then_idle("done", f"→  {MODE_LABELS[mode_key]}", 700)
-                close()
-            return on_click
-        def make_hover(mode_key, item_y):
-            def on_enter(_e):
-                pc.itemconfig(f"hit_{mode_key}", fill="#16202c")
-                pc.config(cursor="hand2")
-            def on_leave(_e):
-                pc.itemconfig(f"hit_{mode_key}", fill="")
-                pc.config(cursor="")
-            return on_enter, on_leave
-        pc.tag_bind(tag, "<Button-1>", make_click(m))
-        enter, leave = make_hover(m, y)
-        pc.tag_bind(tag, "<Enter>", enter)
-        pc.tag_bind(tag, "<Leave>", leave)
-
-    # Close popup wenn ausserhalb geklickt
-    popup.bind("<FocusOut>", lambda e: close())
-    popup.bind("<Escape>",   lambda e: close())
-    popup.focus_force()
+def _short_preview(text: str, n: int = 42) -> str:
+    return text if len(text) <= n else text[:n-1] + "…"
 
 def overlay_redraw() -> None:
-    """Zeichnet das gesamte Overlay (Top-Bar + Status-Body) auf eine Canvas
-    mit gerundeten Ecken. Combobox liegt als embedded window darueber."""
-    r = root_ref["r"]; c = canvas_ref["c"]
-    if not r or not c: return
+    """Aktualisiert die CTk-Widgets je nach overlay_state.
+    Kein Canvas mehr — alles native CTk."""
+    if not ctk_refs["shell"]:
+        return
     s = overlay_state["s"]; msg = overlay_state["msg"]
-    c.delete("status")  # nur Status-Layer loeschen, App-Shell bleibt
+    accent = MODE_COLORS.get(polish_mode, "#7a8290")
 
-    W, H, R = OV_W, OV_H, OV_RADIUS
-    accent = MODE_COLORS.get(polish_mode, "#777a82")
+    # Shell-Border in Mode-Akzentfarbe
+    try:
+        ctk_refs["shell"].configure(border_color=accent)
+    except Exception: pass
+    try:
+        ctk_refs["name_lbl"].configure(text_color=accent)
+    except Exception: pass
 
-    # ---------- App-Shell (Schatten + Body + Highlight + Border) ----------
-    c.delete("shell")
-
-    # 1. Drop-Shadow (zwei leichte Versatz-Polygone fuer Tiefe)
-    _rounded_rect(c, 4, 6, W-2, H,   R, fill="#000000", outline="", tags="shell")
-    _rounded_rect(c, 3, 4, W-2, H-1, R, fill="#04060a", outline="", tags="shell")
-
-    # 2. Main-Body (dunkles, leicht blaeuliches Anthrazit mit fake-gradient durch 2 Layer)
-    _rounded_rect(c, 2, 2, W-2, H-3, R, fill="#0d1219", outline="", tags="shell")
-    # Upper highlight band — fake "glass" reflection
-    _rounded_rect(c, 2, 2, W-2, 56,  R, fill="#161d27", outline="", tags="shell")
-    # Thin top highlight line (subtle glass edge)
-    c.create_line(R+4, 3, W-R-4, 3, fill="#2a3548", width=1, tags="shell")
-
-    # 3. Outer Border in Mode-Akzent (wird beim Pulse animiert)
-    _rounded_rect(c, 2, 2, W-2, H-3, R, fill="", outline=accent, width=2,
-                  tags=("shell", "shell_border"))
-
-    # 4. Akzent-Trennlinie zwischen Header und Body — als gradient-feel
-    c.create_line(28, 56, W-28, 56, fill=accent, width=1, tags="shell")
-    # 2 dezentere Linien als Soft-Glow
-    c.create_line(28, 57, W-28, 57, fill="#1a2230", width=1, tags="shell")
-
-    # 5. App-Name (eleganter — Glyph + Schriftzug + Untertitel)
-    c.create_text(28, 28, text="◆", fill=accent, anchor="w",
-                  font=("Segoe UI", 16, "bold"), tags="shell")
-    c.create_text(50, 22, text="AIbersetzer",
-                  fill="#e8ecf3", anchor="w",
-                  font=("Segoe UI Semibold", 13), tags="shell")
-    c.create_text(50, 40, text="Sprache → Text",
-                  fill="#6a7280", anchor="w",
-                  font=("Segoe UI", 8), tags="shell")
-
-    # ---------- Status-Body (unten) ----------
-    y_mid = 96  # Mitte des Status-Bereichs (Body geht ca. 60-130)
-
+    # Status-Bereich
+    main_text = sub_text = dot_color = None
     if s == "boot":
-        r.attributes("-alpha", 0.9)
-        c.create_text(W//2, y_mid, text=msg or "Wird geladen…",
-                      fill="#7a8290", font=("Segoe UI", 11),
-                      tags="status")
+        main_text = msg or "Wird geladen…"
+        sub_text  = "Modell wird vorbereitet"
+        dot_color = "#7a8290"
     elif s == "idle":
-        r.attributes("-alpha", 0.92)
-        # Dezenter Mode-Akzent-Dot links
-        c.create_oval(28, y_mid-8, 44, y_mid+8,
-                      fill=accent if polish_mode != "off" and api_key_ref["k"] else "#2a2f3a",
-                      outline="", tags="status")
-        c.create_text(56, y_mid-9, text="Bereit",
-                      fill="#e8ecf3", anchor="w",
-                      font=("Segoe UI Semibold", 12), tags="status")
+        main_text = "Bereit"
         if not api_key_ref["k"] and polish_mode not in ("off", "coding"):
-            hint = "Kein API-Key – Polish inaktiv"
+            sub_text = "Kein API-Key – Polish inaktiv"
         else:
-            hint = f"Modus: {MODE_SHORT.get(polish_mode, polish_mode)}   ·   Strg + Leertaste → Aufnahme"
-        c.create_text(56, y_mid+12, text=hint,
-                      fill="#7c8390", anchor="w",
-                      font=("Segoe UI", 9), tags="status")
+            sub_text = f"Strg + Leertaste → Aufnahme"
+        dot_color = accent if polish_mode != "off" else "#2a2f3a"
     elif s == "rec":
-        r.attributes("-alpha", 1.0)
-        # Pulsierender roter Dot — Outline-Glow simuliert
-        c.create_oval(22, y_mid-14, 50, y_mid+14,
-                      fill="#ff3854", outline="#ff8090", width=2, tags="status")
-        c.create_oval(28, y_mid-8, 44, y_mid+8,
-                      fill="#ffd0d8", outline="", tags="status")
-        c.create_text(62, y_mid-9, text="Aufnahme läuft",
-                      fill="#fff", anchor="w",
-                      font=("Segoe UI Semibold", 14), tags="status")
-        c.create_text(62, y_mid+12, text="Strg + Leertaste → Stopp",
-                      fill="#ffc0c8", anchor="w",
-                      font=("Segoe UI", 10), tags="status")
+        main_text = "Aufnahme läuft"
+        sub_text  = "Strg + Leertaste → Stopp"
+        dot_color = "#ff3854"
     elif s == "tx":
-        r.attributes("-alpha", 1.0)
-        c.create_oval(22, y_mid-14, 50, y_mid+14,
-                      fill="#00e5ff", outline="#90f0ff", width=2, tags="status")
-        c.create_text(62, y_mid, text=(msg or "Wird transkribiert…"),
-                      fill="#fff", anchor="w",
-                      font=("Segoe UI Semibold", 13), tags="status")
+        main_text = msg or "Wird transkribiert…"
+        sub_text  = " "
+        dot_color = "#00e5ff"
     elif s == "done":
-        r.attributes("-alpha", 0.95)
-        c.create_oval(22, y_mid-12, 46, y_mid+12,
-                      fill="#6dff8a", outline="", tags="status")
-        c.create_text(58, y_mid, text=msg or "Eingefügt.",
-                      fill="#e8fff0", anchor="w",
-                      font=("Segoe UI Semibold", 12), tags="status")
+        main_text = msg or "Eingefügt."
+        sub_text  = " "
+        dot_color = "#6dff8a"
     elif s == "err":
-        r.attributes("-alpha", 0.95)
-        c.create_oval(22, y_mid-12, 46, y_mid+12,
-                      fill="#ff8a3d", outline="", tags="status")
-        c.create_text(58, y_mid, text=msg or "Fehler – Log prüfen",
-                      fill="#fff", anchor="w",
-                      font=("Segoe UI Semibold", 12), tags="status")
+        main_text = msg or "Fehler – Log prüfen"
+        sub_text  = " "
+        dot_color = "#ff8a3d"
 
-    # Pill-Button immer obendrauf
-    draw_pill_button()
+    try:
+        ctk_refs["status_main"].configure(text=main_text)
+        ctk_refs["status_sub"].configure(text=sub_text)
+        ctk_refs["status_dot"].configure(text_color=dot_color)
+    except Exception: pass
 
 def pulse_tick() -> None:
-    """Pulsiert die Outer-Border-Farbe waehrend Recording/Transcribing."""
-    r = root_ref["r"]; c = canvas_ref["c"]
-    if not r or not c:
+    """Pulsiert die Shell-Border-Farbe waehrend Recording/Transcribing."""
+    r = root_ref["r"]
+    shell = ctk_refs["shell"]
+    if not r or not shell:
         return
     s = overlay_state["s"]
     if s in ("rec", "tx"):
@@ -394,7 +234,7 @@ def pulse_tick() -> None:
         else:
             cols = ("#00e5ff", "#80f0ff")
         try:
-            c.itemconfig("shell_border", outline=cols[pulse_phase["p"]])
+            shell.configure(border_color=cols[pulse_phase["p"]])
         except Exception:
             pass
     try:
@@ -417,46 +257,130 @@ def overlay_set_then_idle(state: str, msg: str, after_ms: int) -> None:
         try: r.after(after_ms, lambda: overlay_set("idle"))
         except Exception: pass
 
-def build_overlay() -> tk.Tk:
-    root = tk.Tk()
+def build_overlay() -> ctk.CTk:
+    root = ctk.CTk()
     root.title(APP_NAME)
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    # Transparenz-Trick: Pixel mit TRANSPARENT_KEY werden komplett durchsichtig
-    # -> abgerundete Ecken sehen "echt" aus (kein eckiger Hintergrund mehr).
-    try:
-        root.attributes("-transparentcolor", TRANSPARENT_KEY)
-    except Exception as e:
-        log.warning(f"transparentcolor not supported: {e}")
-    root.configure(bg=TRANSPARENT_KEY)
     sw = root.winfo_screenwidth()
     root.geometry(f"{OV_W}x{OV_H}+{sw//2 - OV_W//2}+12")
+    # Native Acrylic-Blur (Windows 11) / Mica via pywinstyles wenn verfuegbar
+    if pywinstyles:
+        try:
+            pywinstyles.apply_style(root, "dark")
+            pywinstyles.set_opacity(root, value=0.98)
+        except Exception as e:
+            log.warning(f"pywinstyles: {e}")
 
-    # Single-Canvas — komplett selbst gerendert (kein ttk-Widget mehr).
-    canvas = tk.Canvas(root, width=OV_W, height=OV_H, bg=TRANSPARENT_KEY,
-                       highlightthickness=0, bd=0)
-    canvas.pack(fill="both", expand=True)
+    # Outer Shell — CTkFrame mit echtem corner_radius + Mode-Akzent-Border
+    shell = ctk.CTkFrame(
+        root,
+        fg_color="#0d1219",
+        border_color="#00e5ff",
+        border_width=2,
+        corner_radius=20,
+    )
+    shell.pack(fill="both", expand=True, padx=4, pady=4)
+    ctk_refs["shell"] = shell
     root_ref["r"] = root
-    canvas_ref["c"] = canvas
 
-    # Drag-to-move — aber nicht wenn auf Pill geklickt wird (eigener Handler)
+    # ---------- Header ----------
+    header = ctk.CTkFrame(shell, fg_color="transparent", height=58)
+    header.pack(fill="x", padx=20, pady=(14, 0))
+    header.pack_propagate(False)
+    ctk_refs["header"] = header
+
+    name_frame = ctk.CTkFrame(header, fg_color="transparent")
+    name_frame.pack(side="left")
+    name_lbl = ctk.CTkLabel(name_frame, text="◆  AIbersetzer",
+                            font=ctk.CTkFont("Segoe UI", 17, weight="bold"),
+                            text_color="#00e5ff")
+    name_lbl.pack(anchor="w")
+    sub_lbl = ctk.CTkLabel(name_frame, text="Sprache → Text",
+                           font=ctk.CTkFont("Segoe UI", 9),
+                           text_color="#5a6270")
+    sub_lbl.pack(anchor="w")
+    ctk_refs["name_lbl"] = name_lbl
+    ctk_refs["subtitle"] = sub_lbl
+
+    # ---------- Mode-Picker (native CTkOptionMenu) ----------
+    def on_mode_select(choice: str):
+        for m in MODE_ORDER:
+            if MODE_LABELS[m] == choice:
+                set_mode(m)
+                # Akzentfarbe sofort uebernehmen
+                col = MODE_COLORS.get(m, "#00e5ff")
+                try:
+                    ctk_refs["mode_btn"].configure(button_color=col, button_hover_color=col)
+                except Exception: pass
+                overlay_set_then_idle("done", f"→  {MODE_LABELS[m]}", 700)
+                break
+
+    mode_btn = ctk.CTkOptionMenu(
+        header,
+        values=[MODE_LABELS[m] for m in MODE_ORDER],
+        command=on_mode_select,
+        width=230, height=34,
+        corner_radius=17,
+        font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
+        dropdown_font=ctk.CTkFont("Segoe UI", 11),
+        fg_color="#1a1f2a",
+        button_color=MODE_COLORS.get(polish_mode, "#00e5ff"),
+        button_hover_color=MODE_COLORS.get(polish_mode, "#00e5ff"),
+        text_color="#e8ecf3",
+        dropdown_fg_color="#0d1219",
+        dropdown_hover_color="#1d2530",
+        dropdown_text_color="#e8ecf3",
+        anchor="w",
+    )
+    mode_btn.set(MODE_LABELS[polish_mode])
+    mode_btn.pack(side="right")
+    ctk_refs["mode_btn"] = mode_btn
+
+    # Trennlinie unter Header
+    sep = ctk.CTkFrame(shell, fg_color="#1f2a3a", height=1)
+    sep.pack(fill="x", padx=22, pady=(8, 0))
+
+    # ---------- Status-Body ----------
+    body = ctk.CTkFrame(shell, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=20, pady=(10, 14))
+    ctk_refs["body"] = body
+
+    status_row = ctk.CTkFrame(body, fg_color="transparent")
+    status_row.pack(anchor="w")
+
+    dot_lbl = ctk.CTkLabel(status_row, text="●",
+                           font=ctk.CTkFont("Segoe UI", 22),
+                           text_color="#3a3a3a", width=24)
+    dot_lbl.pack(side="left", padx=(0, 12))
+    ctk_refs["status_dot"] = dot_lbl
+
+    text_frame = ctk.CTkFrame(status_row, fg_color="transparent")
+    text_frame.pack(side="left")
+
+    main_lbl = ctk.CTkLabel(text_frame, text="Bereit",
+                            font=ctk.CTkFont("Segoe UI", 14, weight="bold"),
+                            text_color="#e8ecf3", anchor="w")
+    main_lbl.pack(anchor="w")
+    sub_status = ctk.CTkLabel(text_frame, text="Strg + Leertaste → Aufnahme",
+                              font=ctk.CTkFont("Segoe UI", 10),
+                              text_color="#7c8390", anchor="w")
+    sub_status.pack(anchor="w")
+    ctk_refs["status_main"] = main_lbl
+    ctk_refs["status_sub"] = sub_status
+
+    # ---------- Drag-to-move (auf shell + header + name_lbl, nicht auf mode_btn) ----------
     def on_press(e):
-        # Wenn auf Pill geklickt -> nicht draggen, der Pill-Handler uebernimmt
-        items = canvas.find_overlapping(e.x, e.y, e.x, e.y)
-        for it in items:
-            if "pill" in canvas.gettags(it):
-                return
         root._dx = e.x_root - root.winfo_x()
         root._dy = e.y_root - root.winfo_y()
-        root._dragging = True
     def on_drag(e):
-        if getattr(root, "_dragging", False):
-            root.geometry(f"+{e.x_root - root._dx}+{e.y_root - root._dy}")
-    def on_release(e):
-        root._dragging = False
-    canvas.bind("<Button-1>",        on_press)
-    canvas.bind("<B1-Motion>",       on_drag)
-    canvas.bind("<ButtonRelease-1>", on_release)
+        root.geometry(f"+{e.x_root - root._dx}+{e.y_root - root._dy}")
+    for w in (shell, header, name_frame, name_lbl, sub_lbl, body, status_row,
+              dot_lbl, text_frame, main_lbl, sub_status, sep):
+        try:
+            w.bind("<Button-1>",  on_press)
+            w.bind("<B1-Motion>", on_drag)
+        except Exception: pass
 
     overlay_redraw()
     return root
@@ -1466,19 +1390,9 @@ def polish(text: str, mode: str = "coding") -> str:
         )
         out = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
         dt = time.time() - t0
-        # Refusal-Detektor: wenn das Modell trotzdem refused, fallback auf raw
-        REFUSAL_MARKERS = (
-            "ich kann ", "ich darf nicht", "leider kann",
-            "nicht moeglich", "nicht möglich",
-            "ausserhalb des scope", "außerhalb des scope",
-            "keine anweisung für", "kein technischer auftrag",
-            "reformulierung ist nicht",
-            "i can't", "i cannot", "i'm not able", "sorry", "entschuldigung",
-        )
-        if any(m in out.lower() for m in REFUSAL_MARKERS) and len(out) < 500:
-            log.warning(f"polish[{mode}] refused, falling back to raw: {out[:120]!r}")
-            return text
         log.info(f"polish[{mode}] {dt:.1f}s, in={len(text)} out={len(out)}")
+        # KEIN Refusal-Detektor mehr. Output kommt durch wie er ist.
+        # Bei wirklich leerem Output -> raw text als letztes Fallback.
         return out if out else text
     except Exception as e:
         log.warning(f"polish failed: {e}")
@@ -1548,14 +1462,12 @@ def handle_toggle() -> None:
         except queue.Empty: break
     if not chunks:
         log.info("no audio")
-        overlay_set_then_idle("err", "Keine Audio-Daten", 1500)
-        set_tray("idle", "Leer")
+        overlay_set("idle")
         return
     samples = np.concatenate(chunks, axis=0).flatten()
     if samples.size < SAMPLE_RATE // 4:
-        log.info("audio < 0.25s — skip")
-        overlay_set_then_idle("err", "Zu kurz", 1500)
-        set_tray("idle", "Zu kurz")
+        log.info("audio < 0.25s — silent skip")
+        overlay_set("idle")
         return
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -1568,8 +1480,8 @@ def handle_toggle() -> None:
         clean = light_cleanup(raw)
         log.info(f"transcribed {dt:.1f}s -> {len(clean)} chars: {clean[:120]!r}")
         if not clean:
-            overlay_set_then_idle("err", "Nichts erkannt – lauter sprechen", 2000)
-            set_tray("idle", "Leer")
+            log.info("whisper output empty, silent skip")
+            overlay_set("idle")
             return
         # LLM-Polish wenn Key da UND Mode != off, sonst raw
         if api_key_ref["k"] and polish_mode != "off":
