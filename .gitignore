@@ -1,0 +1,7 @@
+api.key
+voice2prompt.log
+__pycache__/
+*.pyc
+_check.py
+_smoke.py
+_test_polish.py
