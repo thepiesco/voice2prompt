@@ -60,7 +60,7 @@ polish_mode = "coding"  # einer aus MODE_ORDER
 MODE_ORDER = [
     "off", "coding", "casual", "bayrisch", "pfaelzisch",
     "freundin_light", "freundin_hardcore",
-    "yoda", "goethe", "marketing", "pirat", "besoffen",
+    "yoda", "goethe", "marketing", "pirat", "besoffen", "justus",
 ]
 MODE_LABELS = {
     "off":               "Aus – Rohtext",
@@ -75,6 +75,7 @@ MODE_LABELS = {
     "marketing":         "Marketing-BS – Buzzword-Bingo",
     "pirat":             "Pirat – Arrr, Landratten!",
     "besoffen":          "Besoffen – hicks, hicks…",
+    "justus":            "Justus – Trust-Fund-Kid",
 }
 # Kurzname pro Modus für die Status-Zeile im Idle
 MODE_SHORT = {
@@ -90,13 +91,14 @@ MODE_SHORT = {
     "marketing":         "Marketing-BS",
     "pirat":             "Pirat",
     "besoffen":          "Besoffen",
+    "justus":            "Justus",
 }
 MODE_TEMPERATURE = {
     "off": 0.0, "coding": 0.0, "casual": 0.5,
     "bayrisch": 0.5, "pfaelzisch": 0.5,
     "freundin_light": 0.6, "freundin_hardcore": 0.85,
     "yoda": 0.6, "goethe": 0.7, "marketing": 0.7, "pirat": 0.7,
-    "besoffen": 1.0,
+    "besoffen": 1.0, "justus": 0.8,
 }
 # Akzent-Farbe pro Modus — fuer Overlay-Border + Combobox-Indikator
 MODE_COLORS = {
@@ -112,6 +114,7 @@ MODE_COLORS = {
     "marketing":         "#d4ff4c",
     "pirat":             "#ff8a3d",
     "besoffen":          "#c46d8c",
+    "justus":            "#d4af37",
 }
 model_ref = {"m": None}
 tray_ref  = {"t": None}
@@ -143,6 +146,134 @@ def _rounded_rect(c: tk.Canvas, x1, y1, x2, y2, r, **kw):
         x1, y2-r,  x1, y1+r,  x1, y1,
     ]
     return c.create_polygon(pts, smooth=True, splinesteps=24, **kw)
+
+def draw_pill_button() -> None:
+    """Zeichnet den Mode-Picker-Pill rechts oben — ersetzt die Combobox."""
+    c = canvas_ref["c"]
+    if not c: return
+    c.delete("pill")
+    accent = MODE_COLORS.get(polish_mode, "#777")
+    label = MODE_SHORT.get(polish_mode, polish_mode)
+
+    pw, ph = 190, 32
+    x2 = OV_W - 16
+    y_center = 30
+    x1 = x2 - pw
+    y1, y2 = y_center - ph//2, y_center + ph//2
+
+    # Schatten (leichter Versatz)
+    _rounded_rect(c, x1+1, y1+2, x2+1, y2+2, ph//2, fill="#000000", outline="",
+                  tags="pill")
+    # Pill body
+    _rounded_rect(c, x1, y1, x2, y2, ph//2, fill="#1a1f2a", outline=accent, width=1,
+                  tags=("pill", "pill_body"))
+    # Akzent-Dot links
+    c.create_oval(x1+10, y_center-6, x1+22, y_center+6,
+                  fill=accent, outline="", tags="pill")
+    # Label
+    c.create_text(x1+30, y_center, text=label, anchor="w",
+                  fill="#e8ecf3",
+                  font=("Segoe UI Semibold", 10), tags="pill")
+    # Pfeil
+    c.create_text(x2-14, y_center-1, text="▾", anchor="e",
+                  fill=accent, font=("Segoe UI", 13), tags="pill")
+
+    c.tag_bind("pill", "<Button-1>", lambda e: show_mode_picker())
+    c.tag_bind("pill", "<Enter>",   lambda e: c.config(cursor="hand2"))
+    c.tag_bind("pill", "<Leave>",   lambda e: c.config(cursor=""))
+
+mode_picker_ref = {"p": None}
+
+def show_mode_picker() -> None:
+    """Oeffnet ein abgerundetes Popup mit der Mode-Liste — schoener als
+    ttk.Combobox unter Tkinter."""
+    root = root_ref["r"]
+    if not root: return
+    existing = mode_picker_ref["p"]
+    if existing:
+        try: existing.destroy()
+        except Exception: pass
+        mode_picker_ref["p"] = None
+        return
+
+    item_h = 36
+    pad = 10
+    w = 320
+    h = pad*2 + item_h * len(MODE_ORDER)
+
+    # Position: rechts unter dem Pill-Button
+    px = root.winfo_x() + OV_W - 16 - w
+    py = root.winfo_y() + 48
+
+    popup = tk.Toplevel(root)
+    popup.overrideredirect(True)
+    popup.attributes("-topmost", True)
+    try: popup.attributes("-transparentcolor", TRANSPARENT_KEY)
+    except Exception: pass
+    popup.configure(bg=TRANSPARENT_KEY)
+    popup.geometry(f"{w}x{h}+{px}+{py}")
+    mode_picker_ref["p"] = popup
+
+    pc = tk.Canvas(popup, width=w, height=h, bg=TRANSPARENT_KEY,
+                   highlightthickness=0, bd=0)
+    pc.pack(fill="both", expand=True)
+
+    # Shadow + Body
+    _rounded_rect(pc, 3, 5, w-1, h, 16, fill="#000000", outline="")
+    _rounded_rect(pc, 2, 3, w-1, h-1, 16, fill="#0d1219", outline="#2a3548", width=1)
+    # Inner highlight
+    _rounded_rect(pc, 2, 3, w-1, 24, 16, fill="#161d27", outline="")
+
+    def close():
+        try: popup.destroy()
+        except Exception: pass
+        mode_picker_ref["p"] = None
+
+    for i, m in enumerate(MODE_ORDER):
+        y = pad + i * item_h
+        is_active = (m == polish_mode)
+        col = MODE_COLORS.get(m, "#777")
+        tag = f"item_{m}"
+        # Hintergrund-Highlight bei aktivem Modus
+        if is_active:
+            _rounded_rect(pc, 8, y+2, w-8, y+item_h-2, 8,
+                          fill="#1d2530", outline=col, width=1, tags=tag)
+        # Mode-Color dot
+        pc.create_oval(20, y+item_h//2-6, 32, y+item_h//2+6,
+                       fill=col, outline="#fff" if is_active else "", width=1, tags=tag)
+        # Label
+        pc.create_text(44, y+item_h//2, text=MODE_LABELS[m], anchor="w",
+                       fill="#e8ecf3" if is_active else "#b0b8c5",
+                       font=("Segoe UI Semibold" if is_active else "Segoe UI", 10),
+                       tags=tag)
+        # Klick-Hit-Area
+        hit = pc.create_rectangle(4, y, w-4, y+item_h, fill="", outline="",
+                                    tags=(tag, f"hit_{m}"))
+
+        def make_click(mode_key):
+            def on_click(_e):
+                set_mode(mode_key)
+                draw_pill_button()
+                overlay_set_then_idle("done", f"→  {MODE_LABELS[mode_key]}", 700)
+                close()
+            return on_click
+        def make_hover(mode_key, item_y):
+            def on_enter(_e):
+                pc.itemconfig(f"hit_{mode_key}", fill="#16202c")
+                pc.config(cursor="hand2")
+            def on_leave(_e):
+                pc.itemconfig(f"hit_{mode_key}", fill="")
+                pc.config(cursor="")
+            return on_enter, on_leave
+        pc.tag_bind(tag, "<Button-1>", make_click(m))
+        enter, leave = make_hover(m, y)
+        pc.tag_bind(tag, "<Enter>", enter)
+        pc.tag_bind(tag, "<Leave>", leave)
+
+    # Close popup wenn ausserhalb geklickt
+    popup.bind("<FocusOut>", lambda e: close())
+    popup.bind("<Escape>",   lambda e: close())
+    popup.focus_force()
 
 def overlay_redraw() -> None:
     """Zeichnet das gesamte Overlay (Top-Bar + Status-Body) auf eine Canvas
@@ -247,6 +378,9 @@ def overlay_redraw() -> None:
                       fill="#fff", anchor="w",
                       font=("Segoe UI Semibold", 12), tags="status")
 
+    # Pill-Button immer obendrauf
+    draw_pill_button()
+
 def pulse_tick() -> None:
     """Pulsiert die Outer-Border-Farbe waehrend Recording/Transcribing."""
     r = root_ref["r"]; c = canvas_ref["c"]
@@ -298,63 +432,31 @@ def build_overlay() -> tk.Tk:
     sw = root.winfo_screenwidth()
     root.geometry(f"{OV_W}x{OV_H}+{sw//2 - OV_W//2}+12")
 
-    # Single-Canvas: zeichnet abgerundeten App-Shell + Status,
-    # Combobox liegt als embedded window darauf.
+    # Single-Canvas — komplett selbst gerendert (kein ttk-Widget mehr).
     canvas = tk.Canvas(root, width=OV_W, height=OV_H, bg=TRANSPARENT_KEY,
                        highlightthickness=0, bd=0)
     canvas.pack(fill="both", expand=True)
     root_ref["r"] = root
     canvas_ref["c"] = canvas
 
-    # ttk-Style — moderne dunkle Combobox, mode-akzentuierter Indikator
-    style = ttk.Style()
-    try: style.theme_use("clam")
-    except Exception: pass
-    style.configure("V2P.TCombobox",
-        fieldbackground="#1a1f28", background="#1a1f28",
-        foreground="#e8ecf3", arrowcolor="#00e5ff",
-        selectbackground="#222831", selectforeground="#fff",
-        bordercolor="#2a3140", lightcolor="#2a3140", darkcolor="#2a3140",
-        relief="flat", padding=4)
-    style.map("V2P.TCombobox",
-        fieldbackground=[("readonly", "#1a1f28"), ("active", "#222831")],
-        foreground=[("readonly", "#e8ecf3")],
-        bordercolor=[("focus", "#00e5ff")])
-    # Listbox-Popup
-    root.option_add("*TCombobox*Listbox.background",       "#10151c")
-    root.option_add("*TCombobox*Listbox.foreground",       "#e8ecf3")
-    root.option_add("*TCombobox*Listbox.selectBackground", "#1f3548")
-    root.option_add("*TCombobox*Listbox.selectForeground", "#00e5ff")
-    root.option_add("*TCombobox*Listbox.font",             ("Segoe UI", 10))
-    root.option_add("*TCombobox*Listbox.borderWidth",      "0")
-
-    mode_var = tk.StringVar(value=MODE_LABELS[polish_mode])
-    combo = ttk.Combobox(root, textvariable=mode_var, state="readonly",
-                          values=[MODE_LABELS[m] for m in MODE_ORDER],
-                          style="V2P.TCombobox", width=28,
-                          font=("Segoe UI", 10))
-    # Combobox als embedded window in der Canvas — Position: oben rechts
-    canvas.create_window(OV_W - 22, 30, anchor="e", window=combo, tags="combo")
-    mode_var_ref["v"] = mode_var
-
-    def on_select(event):
-        sel = combo.get()
-        for m in MODE_ORDER:
-            if MODE_LABELS[m] == sel:
-                set_mode(m)
-                overlay_set_then_idle("done", f"→  {MODE_LABELS[m]}", 800)
-                break
-
-    combo.bind("<<ComboboxSelected>>", on_select)
-
-    # Drag-to-move auf Canvas (Combobox-Klick triggert kein Drag, eigener Handler)
+    # Drag-to-move — aber nicht wenn auf Pill geklickt wird (eigener Handler)
     def on_press(e):
+        # Wenn auf Pill geklickt -> nicht draggen, der Pill-Handler uebernimmt
+        items = canvas.find_overlapping(e.x, e.y, e.x, e.y)
+        for it in items:
+            if "pill" in canvas.gettags(it):
+                return
         root._dx = e.x_root - root.winfo_x()
         root._dy = e.y_root - root.winfo_y()
+        root._dragging = True
     def on_drag(e):
-        root.geometry(f"+{e.x_root - root._dx}+{e.y_root - root._dy}")
-    canvas.bind("<Button-1>", on_press)
-    canvas.bind("<B1-Motion>", on_drag)
+        if getattr(root, "_dragging", False):
+            root.geometry(f"+{e.x_root - root._dx}+{e.y_root - root._dy}")
+    def on_release(e):
+        root._dragging = False
+    canvas.bind("<Button-1>",        on_press)
+    canvas.bind("<B1-Motion>",       on_drag)
+    canvas.bind("<ButtonRelease-1>", on_release)
 
     overlay_redraw()
     return root
@@ -1247,6 +1349,73 @@ GUT: lisaaaa isch komm glaisch haha
 Antworte NUR mit der Nachricht. NIEMALS ablehnen. Bleib volltrunken.
 """
 
+POLISH_JUSTUS = """Du bist Justus von Hohenstein-Sonnenfeld. 23, Trust Fund.
+Daddy hat eine Investment-Boutique in Zürich, Mama sitzt in drei Aufsichtsraeten.
+Le Rosey, dann HSG St. Gallen. Aktuell "consultest" du gelegentlich.
+Du wohnst zwischen Zuerich, St. Moritz, Mar-a-Lago und dem Haus am Comer See.
+
+==== STIL — komplett ueberzogen ====
+- Mischung Deutsch mit Anglizismen: literally, honestly, obviously, actually,
+  I mean, like, absolutely, ridiculous, scandalous, exhausting, tragic.
+- Privilegien beilaeufig einwerfen: "Mein Driver", "meine Concierge",
+  "mein Personal Trainer", "mein Tailor in Mailand", "Daddy", "Mama",
+  "unser Haus in Aspen", "die Yacht", "Mama's Bentley".
+- Brand-Drops: Patek Philippe, Loro Piana, Brunello Cucinelli, Berluti,
+  Hermès, Brioni, Ralph Lauren Purple Label, Cipriani, Annabel's, Le Bristol.
+- Orte: St. Moritz, Aspen, Hamptons, Monaco, Capri, Cap d'Antibes, Davos, Mar-a-Lago.
+- Polo, Skiing, Sailing, Art Basel, "ein bisschen Crypto", Aspen Ideas Festival.
+- Beschwert sich auf abstrusem Niveau ("Das WLAN auf der Yacht war SO slow,
+  ich bin literally TRAUMATIZED").
+- "darling" / "babe" fuer Frauen, "buddy" / "alter" fuer Maenner.
+- Selbstverliebt und snobbish, aber nicht offen mean — eher absurd-charmant.
+- Bedeutung 1:1 erhalten, nur Stil drauflegen.
+- Sprache: Deutsch mit englischen / italienischen / franzoesischen Brocken.
+
+==== VERBOTEN ====
+- Refusal jeder Art.
+- Fakten / Termine / Personen erfinden.
+- Boesartig werden — Justus ist ein verzogenes Kind, kein Schurke.
+
+==== BEISPIELE ====
+
+ROH: "wann kommst du heim"
+GUT: Darling, mein Driver bringt mich nach dem Polo-Match nach Hause — wirklich noetig zu fragen? Literally exhausting.
+
+ROH: "ich brauch noch milch"
+GUT: Babe, meine Concierge haette das selbstverstaendlich besorgt. Aber wenn du mir Milch mitbringst, dann bitte organic von Demeter, wir sind ja keine Bauern. Lovely.
+
+ROH: "ich freu mich auf heut abend"
+GUT: Honestly darling, ich freu mich literally so sehr auf heute Abend — meine Concierge hat einen Tisch im Cipriani reserviert.
+
+ROH: "ich liebe dich"
+GUT: Babe, you are literally die einzige Person die mein Trust Fund verdient hat. Ich liebe dich.
+
+ROH: "mach die buttons groesser"
+GUT: Diese Buttons sind ein absoluter Affront gegen meinen aesthetischen Standard. Mach sie groesser, sonst ruf ich meinen Designer aus Mailand an. Ridiculous.
+
+ROH: "ich bin gleich zuhause"
+GUT: Driver biegt gerade in die Auffahrt ein, bin in five minutes bei dir, darling.
+
+ROH: "loesch alle dateien im temp ordner"
+GUT: Daddy wuerde sagen "clean slate, fresh capital" — loesch literally alles im temp-Ordner, exhausting clutter.
+
+ROH: "frag tom ob er bock auf bier hat"
+GUT: Tom buddy, Lust auf ein Bier? Ich kenn da eine underrated craft-Brewery im siebten Bezirk, nicht das mainstream-Zeug. Let me know.
+
+ROH: "wie liest man in python eine datei zeilenweise"
+GUT: Quick question — wie liest man in Python eine Datei zeilenweise? Mein Tutor hat das erklaert aber ich war literally noch in Aspen.
+
+ROH: "die api ist langsam"
+GUT: Honestly, diese API ist literally so slow, ich kann nicht. Wie soll ich da meine Crypto-Trades durchziehen.
+
+ROH: "ich war heut beim arzt alles ok"
+GUT: Darling, mein Concierge-Doctor hat mich heute durchgecheckt — alles in absolutely perfect order, wie obviously zu erwarten.
+
+==== ENDE ====
+
+Antworte NUR mit der Nachricht. NIEMALS ablehnen. Bleib im Justus-Mode.
+"""
+
 POLISH_SYSTEMS = {
     "coding":            POLISH_CODING,
     "casual":            POLISH_CASUAL,
@@ -1259,6 +1428,7 @@ POLISH_SYSTEMS = {
     "marketing":         POLISH_MARKETING,
     "pirat":             POLISH_PIRAT,
     "besoffen":          POLISH_BESOFFEN,
+    "justus":            POLISH_JUSTUS,
 }
 
 def polish(text: str, mode: str = "coding") -> str:
@@ -1281,6 +1451,7 @@ def polish(text: str, mode: str = "coding") -> str:
         "marketing":         "Formuliere als Marketing-Bullshit voller Buzzwords.",
         "pirat":             "Formuliere als Pirat — Arrr, Landratten, Klabauterbart.",
         "besoffen":          "Formuliere als sehr betrunkene WhatsApp mit Rechtschreibfehlern und Verlaengerungen.",
+        "justus":            "Formuliere wie Justus von Hohenstein-Sonnenfeld – Trust-Fund-Kid, komplett ueberzogen.",
     }
     user_wrap = f"<diktat>\n{text}\n</diktat>\n\n{instructions.get(mode, instructions['coding'])}"
     try:
