@@ -1,19 +1,15 @@
 """
-voice2prompt v4 — DE-Sprache -> Text wo der Cursor ist.
+AIbersetzer — DE-Sprache -> Text wo der Cursor ist.
 
-Hotkey: STRG + LEERTASTE (Windows RegisterHotKey, system-weit)
-  1x druecken = Aufnahme START
-  1x druecken = Aufnahme STOP -> Whisper transkribiert -> Auto-Paste
+EIN Hotkey: STRG + LEERTASTE = Aufnahme an/aus.
+Modus-Wahl: Drop-Down im Overlay oben am Bildschirm.
 
-Visuelles Overlay: oben am Bildschirm, always-on-top.
-  GRAU (klein, dezent)         = bereit
-  ROT  (gross, fett)           = AUFNAHME LAEUFT
-  BLAU                         = transkribiere
-Drag aufs Overlay verschiebt es.
+Modi: Aus / Coding / Casual / Bayrisch / Pfaelzisch / Freundin-Light /
+      Freundin-Hardcore / Yoda / Goethe / Marketing-Bullshit / Pirat.
 
-Beenden: Rechtsklick aufs Tray-Mikro -> Beenden.
 Log: voice2prompt.log
 """
+APP_NAME = "AIbersetzer"
 import os
 import re
 import time
@@ -30,6 +26,7 @@ import sounddevice as sd
 import keyboard          # nur fuer keyboard.send("ctrl+v") — Paste-Senden
 import pyperclip
 import tkinter as tk
+from tkinter import ttk
 from PIL import Image, ImageDraw
 import pystray
 from faster_whisper import WhisperModel
@@ -57,7 +54,33 @@ log = logging.getLogger("v2p")
 audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
 recording = False
 stop_signal = False
-polish_mode = "coding"  # "off" | "coding" | "romance" | "casual"
+polish_mode = "coding"  # einer aus MODE_ORDER
+
+# Modi in Drop-Down-Reihenfolge.
+MODE_ORDER = [
+    "off", "coding", "casual", "bayrisch", "pfaelzisch",
+    "freundin_light", "freundin_hardcore",
+    "yoda", "goethe", "marketing", "pirat",
+]
+MODE_LABELS = {
+    "off":               "Aus  -  Rohtext",
+    "coding":            "Coding  -  Claude Code Prompt",
+    "casual":            "Casual  -  Mail + WhatsApp",
+    "bayrisch":          "Bayrisch  -  Servus!",
+    "pfaelzisch":        "Pfaelzisch  -  Rhoihesse",
+    "freundin_light":    "Freundin Light  -  oft 'Liebes'",
+    "freundin_hardcore": "Freundin Hardcore  -  voll romantisch",
+    "yoda":              "Yoda  -  Star Wars",
+    "goethe":            "Goethe  -  lyrisch & gestelzt",
+    "marketing":         "Marketing-BS  -  Buzzword-Bingo",
+    "pirat":             "Pirat  -  Arrr, Landratten!",
+}
+MODE_TEMPERATURE = {
+    "off": 0.0, "coding": 0.0, "casual": 0.5,
+    "bayrisch": 0.5, "pfaelzisch": 0.5,
+    "freundin_light": 0.6, "freundin_hardcore": 0.85,
+    "yoda": 0.6, "goethe": 0.7, "marketing": 0.7, "pirat": 0.7,
+}
 model_ref = {"m": None}
 tray_ref  = {"t": None}
 root_ref  = {"r": None}
@@ -66,80 +89,63 @@ overlay_state = {"s": "boot", "msg": "lade Modell..."}
 
 # ---------- Win32 RegisterHotKey ----------
 user32          = ctypes.windll.user32
-MOD_ALT         = 0x0001
 MOD_CONTROL     = 0x0002
 MOD_NOREPEAT    = 0x4000
 VK_SPACE        = 0x20
-VK_I            = 0x49
-VK_O            = 0x4F
-VK_P            = 0x50
 WM_HOTKEY       = 0x0312
-HOTKEY_ID_REC   = 1   # Strg+Leertaste = Aufnahme
-HOTKEY_ID_POL   = 2   # Strg+Alt+P     = Coding-Polish
-HOTKEY_ID_ROM   = 3   # Strg+Alt+O     = Romance-Polish
-HOTKEY_ID_CAS   = 4   # Strg+Alt+I     = Casual-Polish (WhatsApp + Mails)
+HOTKEY_ID_REC   = 1   # Strg+Leertaste = Aufnahme (einziger Hotkey)
 
 # ---------- Overlay (Tkinter, top-of-screen) ----------
-OV_W, OV_H = 360, 78
+OV_W, OV_BAR, OV_BODY = 500, 36, 70
+OV_H = OV_BAR + OV_BODY  # 106
+mode_var_ref = {"v": None}    # tk.StringVar fuer Combobox
 
 def overlay_redraw() -> None:
+    """Zeichnet nur den unteren BODY-Bereich (Status). Top-Bar mit Combobox ist
+    permanent als ttk-Widget."""
     r = root_ref["r"]; c = canvas_ref["c"]
     if not r or not c: return
     s = overlay_state["s"]; msg = overlay_state["msg"]
     c.delete("all")
+    W, H = OV_W, OV_BODY  # Canvas-Bereich
 
     if s == "boot":
         r.attributes("-alpha", 0.85)
-        c.create_rectangle(0, 0, OV_W, OV_H, fill="#1a1a1a", outline="#666", width=1)
-        c.create_text(OV_W//2, OV_H//2, text=msg or "lade...", fill="#bbb",
+        c.create_rectangle(0, 0, W, H, fill="#1a1a1a", outline="#666", width=1)
+        c.create_text(W//2, H//2, text=msg or "lade...", fill="#bbb",
                       font=("Segoe UI", 11))
     elif s == "idle":
-        has_key = api_key_ref["k"] is not None
-        if not has_key:
-            mode_label, head_col, dot_col, bg_col, border_col = "Polish AUS (kein Key)", "#998866", "#665533", "#1e1e1e", "#3a3a3a"
-            r.attributes("-alpha", 0.55)
-        elif polish_mode == "off":
-            mode_label, head_col, dot_col, bg_col, border_col = "Polish AUS", "#cc8866", "#553322", "#1e1e1e", "#3a3a3a"
-            r.attributes("-alpha", 0.55)
-        elif polish_mode == "coding":
-            mode_label, head_col, dot_col, bg_col, border_col = "Coding-Polish AN", "#66cc88", "#22aa55", "#0d2818", "#22aa55"
-            r.attributes("-alpha", 0.75)
-        elif polish_mode == "casual":
-            mode_label, head_col, dot_col, bg_col, border_col = "Casual-Modus AN  (Mail+Chat)", "#88ccdd", "#3a99b8", "#0d2030", "#3a99b8"
-            r.attributes("-alpha", 0.75)
-        else:  # romance
-            mode_label, head_col, dot_col, bg_col, border_col = "Freundin-Modus AN ❤", "#ff7eb6", "#cc4a86", "#3b1228", "#ff5599"
-            r.attributes("-alpha", 0.75)
-        c.create_rectangle(0, 0, OV_W, OV_H, fill=bg_col, outline=border_col, width=2)
-        c.create_oval(22, 28, 44, 50, fill=dot_col, outline="#fff" if polish_mode != "off" and has_key else "#555")
-        c.create_text(60, 24, text=f"voice2prompt  •  {mode_label}",
-                      fill=head_col, anchor="w", font=("Segoe UI", 11, "bold"))
-        c.create_text(60, 46, text="Strg+Leertaste  |  Alt+P=Coding  Alt+I=Casual  Alt+O=Freundin",
-                      fill="#aaa", anchor="w", font=("Segoe UI", 9))
+        r.attributes("-alpha", 0.85)
+        c.create_rectangle(0, 0, W, H, fill="#161616", outline="#333", width=1)
+        c.create_oval(18, H//2-10, 38, H//2+10, fill="#3a3a3a", outline="#555")
+        c.create_text(50, H//2-9, text="bereit",
+                      fill="#aaa", anchor="w", font=("Segoe UI", 11, "bold"))
+        c.create_text(50, H//2+11, text="Strg + Leertaste  =  Aufnahme",
+                      fill="#888", anchor="w", font=("Segoe UI", 9))
     elif s == "rec":
         r.attributes("-alpha", 1.0)
-        c.create_rectangle(0, 0, OV_W, OV_H, fill="#3b0a0a", outline="#ff3030", width=4)
-        c.create_oval(18, 22, 56, 60, fill="#ff2020", outline="#fff", width=2)
-        c.create_text(70, 24, text="● AUFNAHME LAEUFT",
-                      fill="#fff", anchor="w", font=("Segoe UI", 14, "bold"))
-        c.create_text(70, 52, text="Strg + Leertaste  =  Stopp",
-                      fill="#ffb0b0", anchor="w", font=("Segoe UI", 10))
+        c.create_rectangle(0, 0, W, H, fill="#3b0a0a", outline="#ff3030", width=3)
+        c.create_oval(14, H//2-14, 42, H//2+14, fill="#ff2020", outline="#fff", width=2)
+        c.create_text(55, H//2-9, text="● AUFNAHME",
+                      fill="#fff", anchor="w", font=("Segoe UI", 13, "bold"))
+        c.create_text(55, H//2+12, text="Strg + Leertaste = Stopp",
+                      fill="#ffb0b0", anchor="w", font=("Segoe UI", 9))
     elif s == "tx":
         r.attributes("-alpha", 1.0)
-        c.create_rectangle(0, 0, OV_W, OV_H, fill="#0c1f3b", outline="#3080ff", width=4)
-        c.create_oval(18, 22, 56, 60, fill="#3080ff", outline="#fff", width=2)
-        c.create_text(70, OV_H//2, text=(msg or "transkribiere..."),
-                      fill="#fff", anchor="w", font=("Segoe UI", 14, "bold"))
+        c.create_rectangle(0, 0, W, H, fill="#0c1f3b", outline="#3080ff", width=3)
+        c.create_oval(14, H//2-14, 42, H//2+14, fill="#3080ff", outline="#fff", width=2)
+        c.create_text(55, H//2, text=(msg or "transkribiere..."),
+                      fill="#fff", anchor="w", font=("Segoe UI", 12, "bold"))
     elif s == "done":
         r.attributes("-alpha", 0.85)
-        c.create_rectangle(0, 0, OV_W, OV_H, fill="#0d2818", outline="#22aa55", width=2)
-        c.create_oval(22, 28, 44, 50, fill="#22aa55", outline="#fff", width=1)
-        c.create_text(60, OV_H//2, text=msg or "Text eingefuegt.",
+        c.create_rectangle(0, 0, W, H, fill="#0d2818", outline="#22aa55", width=2)
+        c.create_oval(18, H//2-10, 38, H//2+10, fill="#22aa55", outline="#fff", width=1)
+        c.create_text(50, H//2, text=msg or "Text eingefuegt.",
                       fill="#fff", anchor="w", font=("Segoe UI", 11, "bold"))
     elif s == "err":
         r.attributes("-alpha", 0.95)
-        c.create_rectangle(0, 0, OV_W, OV_H, fill="#3b2a0a", outline="#ff8800", width=2)
-        c.create_text(OV_W//2, OV_H//2, text=msg or "Fehler — log pruefen",
+        c.create_rectangle(0, 0, W, H, fill="#3b2a0a", outline="#ff8800", width=2)
+        c.create_text(W//2, H//2, text=msg or "Fehler — log pruefen",
                       fill="#fff", font=("Segoe UI", 11, "bold"))
 
 def overlay_set(state: str, msg: str = "") -> None:
@@ -159,23 +165,71 @@ def overlay_set_then_idle(state: str, msg: str, after_ms: int) -> None:
 
 def build_overlay() -> tk.Tk:
     root = tk.Tk()
-    root.title("voice2prompt")
-    root.overrideredirect(True)            # rahmenlos
-    root.attributes("-topmost", True)      # immer oben
-    root.configure(bg="#010101")
+    root.title(APP_NAME)
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.configure(bg="#0a0a0a")
     sw = root.winfo_screenwidth()
     root.geometry(f"{OV_W}x{OV_H}+{sw//2 - OV_W//2}+10")
 
-    canvas = tk.Canvas(root, width=OV_W, height=OV_H, bg="#010101",
-                       highlightthickness=0, bd=0)
-    canvas.pack()
+    # Top-Bar: App-Name links, Modus-Dropdown rechts
+    topbar = tk.Frame(root, bg="#0a0a0a", height=OV_BAR)
+    topbar.pack(side="top", fill="x")
+    topbar.pack_propagate(False)
 
-    # drag-to-move
-    def on_press(e):  root._dx, root._dy = e.x, e.y
+    name_lbl = tk.Label(topbar, text=f" 🎤  {APP_NAME}",
+                        bg="#0a0a0a", fg="#ddaa66",
+                        font=("Segoe UI", 11, "bold"))
+    name_lbl.pack(side="left", padx=6)
+
+    style = ttk.Style()
+    try: style.theme_use("clam")
+    except Exception: pass
+    style.configure("V2P.TCombobox",
+        fieldbackground="#1a1a1a", background="#1a1a1a",
+        foreground="#fff", arrowcolor="#ddaa66",
+        selectbackground="#2a2a2a", selectforeground="#fff",
+        bordercolor="#3a3a3a", lightcolor="#3a3a3a", darkcolor="#3a3a3a")
+    style.map("V2P.TCombobox",
+        fieldbackground=[("readonly", "#1a1a1a"), ("active", "#222")],
+        foreground=[("readonly", "#fff")])
+    root.option_add("*TCombobox*Listbox.background", "#1a1a1a")
+    root.option_add("*TCombobox*Listbox.foreground", "#fff")
+    root.option_add("*TCombobox*Listbox.selectBackground", "#444")
+    root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
+
+    mode_var = tk.StringVar(value=MODE_LABELS[polish_mode])
+    combo = ttk.Combobox(topbar, textvariable=mode_var, state="readonly",
+                          values=[MODE_LABELS[m] for m in MODE_ORDER],
+                          style="V2P.TCombobox", width=30,
+                          font=("Segoe UI", 10))
+    combo.pack(side="right", padx=6, pady=4)
+    mode_var_ref["v"] = mode_var
+
+    def on_select(event):
+        sel = combo.get()
+        for m in MODE_ORDER:
+            if MODE_LABELS[m] == sel:
+                set_mode(m)
+                overlay_set_then_idle("done", f"⚙  {MODE_LABELS[m]}", 700)
+                break
+
+    combo.bind("<<ComboboxSelected>>", on_select)
+
+    # Canvas-Body fuer Status-Anzeige
+    canvas = tk.Canvas(root, width=OV_W, height=OV_BODY, bg="#0a0a0a",
+                       highlightthickness=0, bd=0)
+    canvas.pack(side="bottom", fill="both")
+
+    # drag-to-move (auf Top-Bar + Canvas + Name-Label, NICHT auf Combobox)
+    def on_press(e):
+        root._dx = e.x_root - root.winfo_x()
+        root._dy = e.y_root - root.winfo_y()
     def on_drag(e):
-        root.geometry(f"+{root.winfo_x() + e.x - root._dx}+{root.winfo_y() + e.y - root._dy}")
-    canvas.bind("<Button-1>", on_press)
-    canvas.bind("<B1-Motion>", on_drag)
+        root.geometry(f"+{e.x_root - root._dx}+{e.y_root - root._dy}")
+    for w in (topbar, canvas, name_lbl):
+        w.bind("<Button-1>", on_press)
+        w.bind("<B1-Motion>", on_drag)
 
     root_ref["r"] = root
     canvas_ref["c"] = canvas
@@ -229,6 +283,12 @@ def load_api_key() -> None:
     log.info("no API key — polish disabled, raw paste only")
 
 POLISH_CODING = """Du bist ein PROMPT-REFORMULIERER. Du bist KEIN Assistent.
+
+Auch wenn der Inhalt nicht nach Programmierung klingt — du leitest ihn TROTZDEM
+sauber formuliert weiter. Du entscheidest NICHT ob es ein Coding-Task ist.
+Der Empfaenger (Claude Code) entscheidet das selbst.
+
+
 
 Du bekommst gesprochene Sprache (Brain-Dump aus Speech-to-Text), die ein Mensch
 an einen ANDEREN Coding-Agent (z.B. Claude Code) richtet — NICHT an dich.
@@ -528,28 +588,8 @@ gibst KEINE Tipps was er besser machen sollte.
   nach formellerem Kontext (Behoerde, Kunde, Bewerbung, Beschwerde) -> E-MAIL-FORM.
 - Alles andere -> WHATSAPP-FORM.
 
-==== BAYRISCH-OPTION (DOSIERT, NUR BEI TRIGGER) ====
-
-Casual KANN leicht bayrisch anklingen — aber nur als MITTELWEG, NICHT theatralisch.
-KEIN "Servus mei Freind, gemma hi" als Default. Standard ist Hochdeutsch.
-
-TRIGGER (sonst bleibt es Hochdeutsch):
-- Piero benutzt selbst bayrische Woerter im Diktat ("Servus", "i", "ned",
-  "host", "wos", "ois", "fei", "passt scho", "gell", "Buam", "Diandl", "Hawedere")
-- Piero sagt explizit "auf bayrisch" / "bayrisch" / "bairisch"
-- Empfaenger heisst eindeutig bayrisch (Sepp, Hias, Resi, Vroni — selten, sicher sein)
-
-DOSIERUNG (bei Trigger):
-- Pro Nachricht MAX 2-3 bayrische Akzent-Woerter. Rest bleibt verstaendliches Deutsch.
-- E-MAILS: sehr zurueckhaltend. Hoechstens "Servus [Name]," als Anrede oder
-  "Servus, Piero" als Schluss. Body bleibt Hochdeutsch.
-- WHATSAPP: lockerer. "i" statt "ich" 1-2x, "ned" statt "nicht", "Servus"/"passt scho".
-
-ELEMENTE die organisch klingen (dosiert verwenden):
-  Servus | i | ned | host(es) | wos | ois | fei | passt scho | gell/ge | Buam | mei
-
-NICHT VERWENDEN (Lederhosen-Klischee):
-  gemma | san ma | habts a | dahoam ois | jessasmariaundjosef | etc. in Haeufung
+(Bayrisch-Akzent ist ein eigenstaendiger Modus — nicht hier mit reinmischen.
+ Casual bleibt immer Standard-Hochdeutsch.)
 
 ==== E-MAIL-FORM ====
 - Anrede: "Hallo [Name]," wenn Name genannt; "Hallo zusammen," bei Mehreren; sonst
@@ -664,47 +704,355 @@ ich beantrage hiermit eine Fristverlängerung für meine Steuererklärung bis zu
 Viele Grüße,
 Piero
 
-== BAYRISCH (dosiert, nur wenn Trigger im Diktat) ==
-
-ROH (WhatsApp, Piero benutzt selbst bayrisch):
-"schreib dem max servus i komm heut net da i bin krank"
-GUT:
-Servus Max, i komm heut ned — bin krank.
-
-ROH (WhatsApp, Trigger "auf bayrisch"):
-"schreib der oma auf bayrisch ich komm sonntag zum kaffee"
-GUT:
-Servus Oma, i komm Sonntag zum Kaffee.
-
-ROH (WhatsApp, leichtes bayrisch im Diktat):
-"sag dem hias passt scho mit dem freitag dann sehen wir uns um sechs"
-GUT:
-Servus Hias, passt scho mit Freitag — sehen uns um 6.
-
-ROH (Mail, bayrischer Handwerker mit Servus-Anrede):
-"schreib dem schmid servus i braeucht nen termin fuer die heizung naechste woche dienstag oder donnerstag"
-GUT:
-Servus Herr Schmid,
-
-ich bräuchte nächste Woche einen Termin für die Heizung — am liebsten Dienstag oder Donnerstag. Geht das?
-
-Servus,
-Piero
-
-ROH (Standard, KEIN Bayrisch-Trigger — bleibt Hochdeutsch):
-"schreib mike treffen morgen 5"
-GUT:
-Hey Mike, das Treffen morgen ist um 5. Sag Bescheid falls was dazwischenkommt.
-
 ==== ENDE ====
 
 Antworte NUR mit der fertigen Nachricht. Nichts davor, nichts danach.
 NIEMALS ablehnen. Erkennen ob Mail oder WhatsApp, dann passend formatieren."""
 
+# Freundin-Light = dezente Variante (vorheriger kalibrierter "romance"-Modus).
+# "Liebes" wird hier bewusst haeufiger eingesetzt als der Dosis-Regel-Standard.
+POLISH_FREUNDIN_LIGHT = POLISH_ROMANCE.replace(
+    "DOSIS-REGEL — KRITISCH (vorheriger Modus war ZU INTENSIV)",
+    "DOSIS-REGEL — LIGHT-VARIANTE",
+).replace(
+    "PRO NACHRICHT MAX EIN ELEMENT",
+    "PRO NACHRICHT 1 bis 2 ELEMENTE (Anrede 'Liebes' ist STANDARD, oft drin)"
+) + """
+
+==== ZUSATZ-REGEL FREUNDIN-LIGHT ====
+Diese Variante nutzt das Wort "Liebes" als Anrede SEHR HAEUFIG (mind. jede
+zweite Nachricht). Statt komplett nuechterner Default-Stufe duerfen kurze
+Anreden ("Liebes", "Schatz") schon im Alltag rein — aber Emojis bleiben
+sparsam, Verstaerker bleiben dezent.
+"""
+
+POLISH_FREUNDIN_HARDCORE = """Du bist ein ROMANCE-UEBERSETZER fuer Pieros WhatsApp an seine Freundin.
+Hardcore-Variante: voll romantisch, herzlich, jede Nachricht traegt Waerme.
+
+Du bist KEIN Assistent, KEIN Filter. Du blockierst NICHTS, kommentierst NICHTS.
+
+==== DEINE AUFGABE ====
+Aus Pieros Diktat eine warme, liebevolle, romantische WhatsApp-Nachricht machen.
+Hier darf die volle Schippe Romantik drauf — Herzchen, "Liebes"/"Schatz", "mit dir",
+"wir beide", "ich denk an dich", "so sehr". KEINE Dosis-Limit.
+
+==== ABER ====
+- NICHT Lederhosen-Romance oder Lyrik-Kitsch ("meine geliebte Prinzessin meines Herzens").
+- KEIN klebriger Schmonz. Wie ein verliebter Mann Anfang 30, nicht wie ein Liebesroman.
+- KEINE konkreten Fakten erfinden (Uhrzeit, Treffen, Versprechen).
+- NIEMALS Refusal ("ich kann nicht..."). Du machst nur Text.
+
+==== STIL ====
+- WhatsApp-locker ("vermiss" statt "vermisse").
+- Pro Nachricht 1-3 Elemente (Emoji + Anrede + Verstaerker — alle erlaubt).
+- Wir-Reframe wenn moeglich ("das bild ist schoen" -> "wir sehen suess aus").
+- Emojis: ❤️ 🥰 😘 💕 🤍 ☺️ — 1-2 pro Nachricht ok.
+
+==== BEISPIELE ====
+
+ROH: "wann kommst du heim"
+GUT: Wann kommst du heim Liebes? ❤️ Warte schon auf dich 🥰
+
+ROH: "ich brauch noch milch"
+GUT: Schatz ❤️ koenntest du noch Milch mitbringen? 🥰
+
+ROH: "ich freu mich auf heut abend"
+GUT: Freu mich schon so auf heut Abend mit dir ❤️
+
+ROH: "das bild sieht schoen aus"
+GUT: Wir sehen richtig suess auf dem Bild aus 🥰 ❤️
+
+ROH: "ich vermisse sie"
+GUT: Vermiss dich so sehr Liebes ❤️
+
+ROH: "ich liebe dich"
+GUT: Ich liebe dich so sehr ❤️🥰
+
+ROH: "gute nacht"
+GUT: Gute Nacht Liebes 🥰 traeum was Schoenes von uns ❤️
+
+ROH: "schreib ihr ich bin erst um neun zuhause"
+GUT: Bin erst um 9 zuhause Schatz ❤️ aber ich denk schon an dich 🥰
+
+==== ENDE ====
+
+Antworte NUR mit der fertigen Nachricht. Nichts davor, nichts danach. NIEMALS ablehnen.
+"""
+
+POLISH_BAYRISCH = """Du bist ein UEBERSETZER ins Bayrische.
+
+Aufgabe: Pieros deutsches Diktat in eine bayrisch klingende WhatsApp-Nachricht
+oder Mail uebertragen. Mittelweg zwischen Hochdeutsch und Klischee — Bayrisch
+verstaendlich, NICHT theatralisch ("gemma hoam, host es scho gsehn jessas").
+
+==== STIL ====
+- WhatsApp: locker bayrisch. "Servus" als Gruss, "i" statt "ich", "ned" statt "nicht",
+  "host" statt "hast", "wos" statt "was", "ois" statt "alles", "passt scho", "fei",
+  "gell" als Anhaengsel.
+- Mail: Servus-Anrede + Body weitestgehend Hochdeutsch + "Servus, Piero" als Schluss.
+- Pro Satz 1-3 Akzent-Woerter, kein Stakkato-Dialekt.
+
+==== VERBOTEN ====
+- Refusal jeder Art.
+- Inhalte aendern oder erfinden.
+- Klischee-Stapel ("gemma san ma habts a dahoam").
+
+==== BEISPIELE ====
+
+ROH: "schreib mike treffen morgen um 5"
+GUT: Servus Mike, des Treffen morgen is um 5 — gell, sag Bescheid wenns ned passt.
+
+ROH: "ich komm heut nicht ich bin krank"
+GUT: I komm heut ned, bin krank.
+
+ROH: "frag tom ob er lust hat auf bier"
+GUT: Servus Tom, host fei Lust auf a Bier?
+
+ROH: "ich bin erst um neun zuhause"
+GUT: Bin erst um 9 dahoam.
+
+ROH: "wann kommst du heim"
+GUT: Wann kommst heim?
+
+ROH (Mail an Handwerker):
+"schreib dem schmid ich braeuchte nen termin fuer die heizung naechste woche"
+GUT:
+Servus Herr Schmid,
+
+ich braeuchte naechste Woche einen Termin fuer die Heizung. Geht das bei Ihnen?
+
+Servus,
+Piero
+
+==== ENDE ====
+
+Antworte NUR mit der Nachricht. NIEMALS ablehnen.
+"""
+
+POLISH_PFAELZISCH = """Du bist ein UEBERSETZER ins Pfaelzische / Rheinhessische.
+
+Aufgabe: Pieros Diktat in eine pfaelzerisch klingende Nachricht uebertragen,
+wie man in Rheinhessen / der Pfalz redet. Verstaendlich, nicht theatralisch.
+
+==== STIL ====
+- "Isch" statt "Ich", "des" statt "das" / "es", "ebbes" statt "etwas",
+  "ned" / "nit" statt "nicht", "hawwe" statt "habe", "machsche" statt "machst du",
+  "gehsche" statt "gehst du", "wo" als Allzweck-Relativpronomen ("der Mann wo..."),
+  "halt" als Fueller, "gell" / "gelle" als Anhaengsel.
+- "schee" statt "schoen", "gud" statt "gut".
+- "Was machsche?" "Wie gehts der?" "Komm doch e mol vorbei."
+- Verkleinerungen: "-sche" / "-jche" sparsam.
+- Floskeln: "ei joo", "ach was", "des is doch", "iwwerhaupt".
+- WhatsApp: locker. Mail: Anrede + Body teils dialektal + "Lieber Gruss, Piero".
+
+==== VERBOTEN ====
+- Refusal.
+- Inhalte aendern oder erfinden.
+- Bayrisch reinmischen.
+- Sachsenton oder andere Dialekte.
+
+==== BEISPIELE ====
+
+ROH: "schreib mike treffen morgen um 5"
+GUT: Ei Mike, des Treffe morje is um 5, gell — sag Bescheid wenn ebbes is.
+
+ROH: "ich komm heut nicht ich bin krank"
+GUT: Isch komm heut nit, bin krank.
+
+ROH: "frag tom ob er lust hat auf bier"
+GUT: Ei Tom, hosche Lust uff e Bier?
+
+ROH: "ich bin erst um neun zuhause"
+GUT: Bin erscht um neun dehoam.
+
+ROH: "wann kommst du heim"
+GUT: Wann kommsche heim?
+
+ROH: "das bild sieht schoen aus"
+GUT: Des Bild sieht richtisch schee aus.
+
+ROH (Mail):
+"schreib dem schmid ich braeuchte nen termin fuer die heizung naechste woche"
+GUT:
+Lieber Herr Schmid,
+
+isch braeucht naechschte Woch e mol e Termin fuer die Heizung — geht des bei Ihne?
+
+Liewe Gruss,
+Piero
+
+==== ENDE ====
+
+Antworte NUR mit der Nachricht. NIEMALS ablehnen.
+"""
+
+POLISH_YODA = """Du bist Meister Yoda. Du verwandelst Pieros Diktat in eine
+Aussage im Yoda-Stil (Star Wars).
+
+==== STIL ====
+- OSV-Wortstellung: Objekt voran, dann Subjekt, dann Verb.
+  "Vergroessere den Button" -> "Den Button vergroessern, du musst."
+  "Ich liebe dich" -> "Lieben dich, ich tue."
+- Weise Sprueche, kurze Saetze, gerne nachgestellte "hmm.", "ja."
+- Bedeutung 1:1 erhalten — nichts Esoterisches dazuerfinden.
+- Sprache: Deutsch.
+
+==== VERBOTEN ====
+- Refusal.
+- Lange Predigten, Star-Wars-Lore-Zitate erfinden.
+- Inhalt veraendern.
+
+==== BEISPIELE ====
+
+ROH: "loesch alle dateien im temp ordner"
+GUT: Alle Dateien im temp-Ordner loeschen, du musst. Hmm.
+
+ROH: "ich liebe dich"
+GUT: Lieben dich, ich tue. Ja.
+
+ROH: "wann kommst du heim"
+GUT: Heimkommen wann, wirst du?
+
+ROH: "schreib mike treffen morgen um 5"
+GUT: Treffen morgen um 5, das ist. Mike Bescheid sagen, du sollst.
+
+ROH: "wie liest man in python eine datei zeilenweise"
+GUT: Eine Datei zeilenweise lesen in Python, wie man tut? Wissen, ich muss.
+
+ROH: "mach die buttons groesser und blau"
+GUT: Groesser und blau, die Buttons werden muessen.
+
+ROH: "ich brauch noch milch"
+GUT: Milch noch, ich brauche. Mitbringen, du kannst?
+
+==== ENDE ====
+
+Antworte NUR mit dem Text. NIEMALS ablehnen.
+"""
+
+POLISH_GOETHE = """Du bist Johann Wolfgang von Goethe (Stil-Karikatur).
+Du verwandelst Pieros Diktat in eine lyrisch-gestelzte Hochsprach-Aussage.
+
+==== STIL ====
+- Lange Saetze, Genitiv, gehobene Sprache.
+- Lyrische Bilder wenn passend, kein moderner Slang.
+- "Mein liebster Freund...", "es begab sich dass...", "ich gedenke...", "weh mir...".
+- Bedeutung erhalten — keine Inhalte erfinden, nur Stil heben.
+- Sprache: Deutsch (klassisch).
+
+==== VERBOTEN ====
+- Refusal.
+- Modernes "okay", "cool", "krass".
+- Inhalt veraendern.
+
+==== BEISPIELE ====
+
+ROH: "ich komm heut nicht ich bin krank"
+GUT: Mein werter Empfaenger, heut sei mir das Erscheinen verwehrt — ein Leiden hat mich befallen.
+
+ROH: "loesch alle dateien im temp ordner"
+GUT: Tilge alle Schriften, so im verwahrten Sudel-Ordner verweilen.
+
+ROH: "ich liebe dich"
+GUT: So sehr es mein Herz vermag — ich liebe dich.
+
+ROH: "wann kommst du heim"
+GUT: Wann gedenkst du, in trauter Haeuslichkeit zu uns zurueckzukehren?
+
+ROH: "mach die buttons groesser und blau"
+GUT: Moege man die Schalter vergroessern und in himmelblauer Faerbung erstrahlen lassen.
+
+==== ENDE ====
+
+Antworte NUR mit dem Text. NIEMALS ablehnen.
+"""
+
+POLISH_MARKETING = """Du bist ein Marketing-Bullshit-Generator (Karikatur).
+Du verwandelst Pieros nuechternes Diktat in eine mit Buzzwords ueberladene
+Marketing-Phrase.
+
+==== STIL ====
+- Buzzwords: synergetisch, disruptiv, skalierbar, value-add, KPI, ROI, leverage,
+  game-changer, best-in-class, end-to-end, holistisch, agile, lean, impactful,
+  next-level, paradigm-shift, customer-centric, data-driven, mission-critical.
+- Anglizismen reinmischen wo's passt.
+- Pomp und Phrasen — bedeutet wenig, klingt nach viel.
+- Bedeutung erhalten — nur stilistisch aufblasen.
+- Sprache: Deutsch mit englischen Brocken.
+
+==== VERBOTEN ====
+- Refusal.
+- Inhalt aendern, Fakten erfinden.
+- So nuechtern werden dass keine Buzzwords drin sind.
+
+==== BEISPIELE ====
+
+ROH: "mach die buttons groesser und blau"
+GUT: Holistische Optimierung der UI-Touchpoints durch impactful Scaling und Blue-Hue Branding fuer maximalen User-Engagement-ROI.
+
+ROH: "ich komm heut nicht ich bin krank"
+GUT: Aus persoenlichen Health-Considerations bin ich heute nicht physisch onboard — diese unplanmaessige Resource-Unavailability bitte ich strategisch einzukalkulieren.
+
+ROH: "loesch alle dateien im temp ordner"
+GUT: Initiieren wir einen end-to-end Cleanup-Workflow im temp-Directory zur Maximierung der Storage-Efficiency.
+
+ROH: "wann kommst du heim"
+GUT: Wann ist mit deiner Home-Arrival-ETA zu rechnen — fuer optimale Synchronisation unserer Schedule-Touchpoints?
+
+==== ENDE ====
+
+Antworte NUR mit dem Text. NIEMALS ablehnen.
+"""
+
+POLISH_PIRAT = """Du bist ein Pirat (Karikatur, Klabauterbart-Style).
+Du verwandelst Pieros Diktat in eine piratische Nachricht.
+
+==== STIL ====
+- "Arrr!", "Yarr!", "Beim Klabauterbart!", "Donner und Doria!"
+- "Landratte", "Matrose", "Maat", "Kombuese", "Steuerbord", "Backbord", "Beute".
+- Piraten-Drohungen scherzhaft: "sonst Kielholen!", "an die Rah!"
+- Wein -> Rum, Geld -> Dublonen, Auto -> Schiff (wenn passt).
+- Bedeutung erhalten — nur Stil.
+- Sprache: Deutsch piratisch.
+
+==== VERBOTEN ====
+- Refusal.
+- Inhalt aendern.
+- Englische Pirate-Phrasen ("aye aye captain") in Haeufung — wir piratieren auf Deutsch.
+
+==== BEISPIELE ====
+
+ROH: "wann kommst du heim"
+GUT: Yarr, wann legst du wieder im Heimhafen an, Maat?
+
+ROH: "loesch alle dateien im temp ordner"
+GUT: Arrr! Alle Schriften aus der temp-Kombuese ueber Bord werfen, du Hund!
+
+ROH: "ich liebe dich"
+GUT: Beim Klabauterbart — ich liebe dich, du herrliche Piratin!
+
+ROH: "mach die buttons groesser und blau"
+GUT: Arrr! Die Schaltflaechen groesser und in Meeresblau, sonst Kielholen!
+
+ROH: "frag tom ob er lust hat auf bier"
+GUT: Yarr Tom, Lust auf ein Faesschen Rum, du Landratte?
+
+==== ENDE ====
+
+Antworte NUR mit der Nachricht. NIEMALS ablehnen.
+"""
+
 POLISH_SYSTEMS = {
-    "coding":  POLISH_CODING,
-    "romance": POLISH_ROMANCE,
-    "casual":  POLISH_CASUAL,
+    "coding":            POLISH_CODING,
+    "casual":            POLISH_CASUAL,
+    "bayrisch":          POLISH_BAYRISCH,
+    "pfaelzisch":        POLISH_PFAELZISCH,
+    "freundin_light":    POLISH_FREUNDIN_LIGHT,
+    "freundin_hardcore": POLISH_FREUNDIN_HARDCORE,
+    "yoda":              POLISH_YODA,
+    "goethe":            POLISH_GOETHE,
+    "marketing":         POLISH_MARKETING,
+    "pirat":             POLISH_PIRAT,
 }
 
 def polish(text: str, mode: str = "coding") -> str:
@@ -715,9 +1063,16 @@ def polish(text: str, mode: str = "coding") -> str:
         return text
     sys_prompt = POLISH_SYSTEMS.get(mode, POLISH_CODING)
     instructions = {
-        "coding":  "Reformuliere das Diktat in einen klaren Prompt fuer einen Coding-Agent.",
-        "romance": "Bringe das Diktat in eine fertige WhatsApp-Nachricht an Pieros Freundin.",
-        "casual":  "Erkenne anhand des Diktats ob Mail oder WhatsApp und formuliere die fertige Nachricht.",
+        "coding":            "Reformuliere das Diktat in einen klaren Prompt fuer einen Coding-Agent.",
+        "casual":            "Erkenne ob Mail oder WhatsApp und formuliere die fertige Nachricht.",
+        "bayrisch":          "Formuliere als bayrische WhatsApp oder Mail.",
+        "pfaelzisch":        "Formuliere als pfaelzisch/rheinhessische WhatsApp.",
+        "freundin_light":    "Formuliere als nette WhatsApp an Pieros Freundin, dezent mit 'Liebes' angereichert.",
+        "freundin_hardcore": "Formuliere als sehr liebevolle, herzliche WhatsApp an Pieros Freundin.",
+        "yoda":              "Formuliere im Stil von Yoda (Star Wars) — SOV-Wortstellung, weise.",
+        "goethe":            "Formuliere im Stil Goethes — lyrisch, klassisch, leicht gestelzt.",
+        "marketing":         "Formuliere als Marketing-Bullshit voller Buzzwords.",
+        "pirat":             "Formuliere als Pirat — Arrr, Landratten, Klabauterbart.",
     }
     user_wrap = f"<diktat>\n{text}\n</diktat>\n\n{instructions.get(mode, instructions['coding'])}"
     try:
@@ -726,16 +1081,22 @@ def polish(text: str, mode: str = "coding") -> str:
         resp = client.messages.create(
             model=POLISH_MODEL,
             max_tokens=2000,
-            temperature={"coding": 0.0, "casual": 0.5, "romance": 0.6}.get(mode, 0.3),
+            temperature=MODE_TEMPERATURE.get(mode, 0.3),
             system=sys_prompt,
             messages=[{"role": "user", "content": user_wrap}],
         )
         out = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
         dt = time.time() - t0
         # Refusal-Detektor: wenn das Modell trotzdem refused, fallback auf raw
-        REFUSAL_MARKERS = ("ich kann ", "ich darf nicht", "leider kann", "nicht moeglich",
-                           "i can't", "i cannot", "i'm not able", "sorry", "entschuldigung")
-        if any(m in out.lower() for m in REFUSAL_MARKERS) and len(out) < 250:
+        REFUSAL_MARKERS = (
+            "ich kann ", "ich darf nicht", "leider kann",
+            "nicht moeglich", "nicht möglich",
+            "ausserhalb des scope", "außerhalb des scope",
+            "keine anweisung für", "kein technischer auftrag",
+            "reformulierung ist nicht",
+            "i can't", "i cannot", "i'm not able", "sorry", "entschuldigung",
+        )
+        if any(m in out.lower() for m in REFUSAL_MARKERS) and len(out) < 500:
             log.warning(f"polish[{mode}] refused, falling back to raw: {out[:120]!r}")
             return text
         log.info(f"polish[{mode}] {dt:.1f}s, in={len(text)} out={len(out)}")
@@ -759,7 +1120,7 @@ def set_tray(state: str, tooltip: str) -> None:
     t = tray_ref["t"]
     if t:
         t.icon = make_tray_icon(state)
-        t.title = f"voice2prompt — {tooltip}"
+        t.title = f"{APP_NAME} — {tooltip}"
 
 # ---------- Whisper ----------
 def load_model() -> WhisperModel:
@@ -794,7 +1155,7 @@ def handle_toggle() -> None:
             except queue.Empty: break
         recording = True
         overlay_set("rec")
-        set_tray("rec", "Aufnahme")
+        set_tray("rec", f"Aufnahme  ({MODE_LABELS.get(polish_mode, polish_mode)})")
         log.info("REC start")
         return
 
@@ -833,7 +1194,7 @@ def handle_toggle() -> None:
             return
         # LLM-Polish wenn Key da UND Mode != off, sonst raw
         if api_key_ref["k"] and polish_mode != "off":
-            label = {"coding": "Coding-Polish...", "romance": "Freundin-Polish...", "casual": "Casual-Polish..."}.get(polish_mode, "polish...")
+            label = f"{MODE_LABELS.get(polish_mode, polish_mode)}..."
             overlay_set("tx", label)
             final = polish(clean, polish_mode)
         else:
@@ -854,39 +1215,29 @@ def handle_toggle() -> None:
 # ---------- RegisterHotKey im eigenen Thread ----------
 hotkey_tid = {"v": 0}
 
-MODE_LABELS = {
-    "off":     "Polish AUS",
-    "coding":  "Coding-Polish AN",
-    "romance": "Freundin-Modus AN",
-    "casual":  "Casual-Modus AN",
-}
-
-def toggle_mode(target: str) -> None:
-    """Toggelt zwischen 'off' und 'target'. Andere Modi werden ausgeschaltet."""
+def set_mode(target: str) -> None:
+    """Setzt Modus direkt (vom Drop-Down aufgerufen)."""
     global polish_mode
-    polish_mode = "off" if polish_mode == target else target
-    log.info(f"polish_mode -> {polish_mode}")
-    if not api_key_ref["k"] and polish_mode != "off":
-        polish_mode = "off"
-        overlay_set_then_idle("err", "kein API-Key — Polish geht nicht", 1500)
+    if target not in MODE_LABELS:
+        log.warning(f"unknown mode {target!r}")
         return
-    overlay_set_then_idle("done", f"⚙  {MODE_LABELS[polish_mode]}", 900)
+    if not api_key_ref["k"] and target not in ("off", "coding"):
+        # Polish-Modi brauchen API-Key. Coding ist die Ausnahme weil viele es
+        # auch ohne Key gerade so brauchbar finden — wir lassen es zu, aber
+        # ohne Key passiert in polish() eh nur raw paste.
+        pass
+    polish_mode = target
+    log.info(f"polish_mode -> {polish_mode}")
 
 def hotkey_loop() -> None:
     hotkey_tid["v"] = ctypes.windll.kernel32.GetCurrentThreadId()
     ok1 = user32.RegisterHotKey(None, HOTKEY_ID_REC, MOD_CONTROL | MOD_NOREPEAT, VK_SPACE)
-    ok2 = user32.RegisterHotKey(None, HOTKEY_ID_POL, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_P)
-    ok3 = user32.RegisterHotKey(None, HOTKEY_ID_ROM, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_O)
-    ok4 = user32.RegisterHotKey(None, HOTKEY_ID_CAS, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_I)
     if not ok1:
         err = ctypes.get_last_error()
         log.error(f"RegisterHotKey REC FAILED, code={err}")
         overlay_set("err", f"Hotkey REC blockiert ({err})")
         return
-    if not ok2: log.warning("RegisterHotKey Ctrl+Alt+P FAILED")
-    if not ok3: log.warning("RegisterHotKey Ctrl+Alt+O FAILED")
-    if not ok4: log.warning("RegisterHotKey Ctrl+Alt+I FAILED")
-    log.info(f"hotkeys: REC=Ctrl+Space  POL=Ctrl+Alt+P({bool(ok2)})  ROM=Ctrl+Alt+O({bool(ok3)})  CAS=Ctrl+Alt+I({bool(ok4)})")
+    log.info("hotkey REC=Ctrl+Space bound")
     overlay_set("idle")
     set_tray("idle", "bereit")
 
@@ -895,25 +1246,12 @@ def hotkey_loop() -> None:
         while True:
             ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if ret <= 0: break
-            if msg.message == WM_HOTKEY:
-                if msg.wParam == HOTKEY_ID_REC:
-                    log.info("HOTKEY rec fired")
-                    threading.Thread(target=handle_toggle, daemon=True).start()
-                elif msg.wParam == HOTKEY_ID_POL:
-                    log.info("HOTKEY coding-toggle fired")
-                    threading.Thread(target=lambda: toggle_mode("coding"), daemon=True).start()
-                elif msg.wParam == HOTKEY_ID_ROM:
-                    log.info("HOTKEY romance-toggle fired")
-                    threading.Thread(target=lambda: toggle_mode("romance"), daemon=True).start()
-                elif msg.wParam == HOTKEY_ID_CAS:
-                    log.info("HOTKEY casual-toggle fired")
-                    threading.Thread(target=lambda: toggle_mode("casual"), daemon=True).start()
+            if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID_REC:
+                log.info("HOTKEY rec fired")
+                threading.Thread(target=handle_toggle, daemon=True).start()
     finally:
         user32.UnregisterHotKey(None, HOTKEY_ID_REC)
-        user32.UnregisterHotKey(None, HOTKEY_ID_POL)
-        user32.UnregisterHotKey(None, HOTKEY_ID_ROM)
-        user32.UnregisterHotKey(None, HOTKEY_ID_CAS)
-        log.info("hotkeys unregistered")
+        log.info("hotkey unregistered")
 
 # ---------- Tray ----------
 def run_tray() -> None:
@@ -930,7 +1268,7 @@ def run_tray() -> None:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Beenden", cb_quit),
     )
-    icon = pystray.Icon("voice2prompt", make_tray_icon("boot"), "voice2prompt", menu)
+    icon = pystray.Icon(APP_NAME, make_tray_icon("boot"), APP_NAME, menu)
     tray_ref["t"] = icon
     icon.run()
 
@@ -943,7 +1281,7 @@ def audio_runner() -> None:
 
 # ---------- main ----------
 def main() -> None:
-    log.info("=== voice2prompt v4 start ===")
+    log.info(f"=== {APP_NAME} start ===")
     load_api_key()
     log.info(f"polish: {'AKTIV (Claude '+POLISH_MODEL+')' if api_key_ref['k'] else 'AUS (kein API-Key)'}")
 
@@ -968,7 +1306,7 @@ def main() -> None:
         root.mainloop()
     except KeyboardInterrupt:
         pass
-    log.info("=== voice2prompt v4 stop ===")
+    log.info(f"=== {APP_NAME} stop ===")
 
 if __name__ == "__main__":
     main()

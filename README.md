@@ -1,42 +1,49 @@
-# voice2prompt
+# AIbersetzer
 
-Deutsche Spracheingabe für Claude Code (und alles andere mit Texteingabe).
-Drück eine Taste, sprich los, drück wieder — dein Text landet als sauber
-formulierter Prompt genau dort, wo dein Cursor gerade steht.
+> Sprache-zu-Text mit Stil. Drück eine Taste, sprich los, drück wieder — und je
+> nachdem welchen Modus du gewählt hast, landet dein Text als Coding-Prompt, als
+> liebevolle WhatsApp, als bayrische Begrüßung oder als Yoda-Weisheit im aktiven
+> Eingabefeld.
 
-Läuft komplett lokal (Whisper auf CPU) und kostet pro Polish-Aufruf ~0.001 €
-über die Anthropic-API (Claude Haiku).
+Läuft komplett lokal (Whisper auf CPU). Der Polish-Schritt geht über die
+Anthropic-API (Claude Haiku, ~0.001 € pro Aufnahme).
 
-## Was es kann
+## Bedienung
 
-Vier Modi, exklusiv schaltbar per Hotkey:
+**Ein Hotkey: `Strg + Leertaste` = Aufnahme an/aus.**
 
-| Hotkey | Modus | Was es macht |
-|---|---|---|
-| **Strg+Leertaste** | Aufnahme an / aus | Whisper transkribiert deutsche Sprache lokal |
-| **Strg+Alt+P** | **Coding** | Brain-Dump → klarer Imperativ-Prompt für Claude Code |
-| **Strg+Alt+I** | **Casual** | Erkennt Mail vs WhatsApp → fertige Nachricht mit Anrede + Schluss bzw. lockerem Ton |
-| **Strg+Alt+O** | **Freundin** | Warme, liebevolle WhatsApp-Nachricht — wertet trockene Aussagen romantisch auf |
+Modus wählst du im **Drop-Down** oben im Overlay-Fenster per Mausklick.
 
-Drückst du denselben Modus zweimal → Polish aus, nur roher Whisper-Text.
-Drückst du einen anderen Modus → wechselt. Overlay oben am Bildschirm zeigt
-den aktuellen Modus farbig an (grün/blau/pink).
+## Modi
+
+| Modus | Was er macht |
+|---|---|
+| **Aus** | Rohtext aus Whisper, kein Polish |
+| **Coding** | Claude-Code-Prompt — Frage bleibt Frage, Aussage bleibt Aussage, Auftrag wird Imperativ |
+| **Casual** | Mail (mit Anrede + „Viele Grüße, Piero") ODER WhatsApp, auto-erkannt |
+| **Bayrisch** | Servus! Bayrische Färbung — dosiert, kein Lederhosen-Klischee |
+| **Pfälzisch** | Rhoihesse — „Ei Mike, des is um 5, gell" |
+| **Freundin Light** | Liebevoll-dezent. Sagt häufig „Liebes" — sparsame Emojis |
+| **Freundin Hardcore** | Volle Romance — Herzchen, Verstärker, „mit dir", „wir beide" |
+| **Yoda** | „Loeschen die Dateien, du musst. Hmm." |
+| **Goethe** | „Wann gedenkst du in trauter Häuslichkeit heim zu finden?" |
+| **Marketing-BS** | „Holistische Synergien für maximales User-Engagement-ROI" |
+| **Pirat** | „Yarr Matrose! Beim Klabauterbart!" |
 
 ## Installation (für Freunde mit Claude Code)
 
 ```bash
-# 1. Repo holen
+# 1. Klonen
 git clone https://github.com/thepiesco/voice2prompt.git
 cd voice2prompt
 
 # 2. Python-Deps
 py -m pip install -r requirements.txt
 
-# 3. API-Key eintragen (für Polish — optional, ohne läuft nur Whisper-Roh-Text)
-#    Key holen: https://console.anthropic.com/settings/keys
+# 3. API-Key (für Polish — ohne läuft nur Whisper-Roh-Text)
 copy api.key.example api.key
-notepad api.key
-#    Inhalt durch deinen echten sk-ant-... Key ersetzen, speichern, schließen
+notepad api.key      # sk-ant-... Key reinpasten, speichern
+# Key holen: https://console.anthropic.com/settings/keys
 
 # 4. Starten
 start.cmd
@@ -44,10 +51,11 @@ start.cmd
 
 Beim ersten Start lädt Whisper das deutsche Modell (~480 MB, einmalig).
 
-Optional: **Autostart bei Windows-Login** — Verknüpfung in den Startup-Ordner:
+### Autostart bei Windows-Login
+
 ```powershell
 $s = (New-Object -ComObject WScript.Shell).CreateShortcut(
-    "$([Environment]::GetFolderPath('Startup'))\voice2prompt.lnk")
+    "$([Environment]::GetFolderPath('Startup'))\AIbersetzer.lnk")
 $s.TargetPath = (Get-Command pythonw).Source
 $s.Arguments = '"voice2prompt.py"'
 $s.WorkingDirectory = (Get-Location).Path
@@ -55,25 +63,28 @@ $s.WindowStyle = 7
 $s.Save()
 ```
 
+## Eine Zeile in Claude Code
+
+```
+Klone github.com/thepiesco/voice2prompt nach C:\Tools\AIbersetzer,
+installiere requirements.txt, kopiere api.key.example zu api.key (Inhalt mit
+meinem eigenen Anthropic-Key ersetzen — Key holen unter
+console.anthropic.com/settings/keys), dann start.cmd starten.
+```
+
 ## Tipps
 
-- **Cursor erst ins Zielfenster setzen, dann Strg+Leertaste.** Das Tool
-  paste'd via Strg+V ins aktive Fenster — wenn dein Cursor woanders ist,
-  landet der Text woanders.
-- **Beenden:** Rechtsklick aufs Mikro-Icon in der Taskleiste → Beenden,
-  oder `stop.cmd`.
-- **Debug:** `debug.cmd` startet mit sichtbarer Konsole. Log liegt in
-  `voice2prompt.log`.
-- **Mikrofon ändern:** `py _check.py` listet alle Input-Devices.
-
-## Modi-Anpassung
-
-Die System-Prompts der Polish-Modi stehen in `voice2prompt.py` als
-`POLISH_CODING`, `POLISH_CASUAL`, `POLISH_ROMANCE`. Komplett anpassbar — dein
-eigener Stil, deine eigenen Few-Shot-Beispiele.
+- **Cursor erst ins Zielfenster, dann Strg+Leertaste.** Tool paste'd via Strg+V
+  ins aktive Fenster.
+- **Beenden:** Rechtsklick aufs Mikro-Tray-Icon → Beenden, oder `stop.cmd`.
+- **Debug:** `debug.cmd` startet mit sichtbarer Konsole. Log: `voice2prompt.log`.
+- **Modi-Anpassung:** System-Prompts liegen in `voice2prompt.py` als
+  `POLISH_CODING`, `POLISH_CASUAL`, `POLISH_BAYRISCH` usw. — komplett editierbar.
 
 ## Stack
 
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (small, int8, CPU)
 - [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-python) (Claude Haiku 4.5)
-- Tkinter Overlay, pystray Tray-Icon, Windows `RegisterHotKey` für stabile globale Hotkeys
+- Tkinter Overlay + ttk.Combobox für Modus-Wahl
+- Windows `RegisterHotKey` für stabilen globalen Aufnahme-Hotkey
+- pystray Tray-Icon
