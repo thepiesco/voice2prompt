@@ -60,7 +60,7 @@ polish_mode = "coding"  # einer aus MODE_ORDER
 MODE_ORDER = [
     "off", "coding", "casual", "bayrisch", "pfaelzisch",
     "freundin_light", "freundin_hardcore",
-    "yoda", "goethe", "marketing", "pirat",
+    "yoda", "goethe", "marketing", "pirat", "besoffen",
 ]
 MODE_LABELS = {
     "off":               "Aus  -  Rohtext",
@@ -74,12 +74,29 @@ MODE_LABELS = {
     "goethe":            "Goethe  -  lyrisch & gestelzt",
     "marketing":         "Marketing-BS  -  Buzzword-Bingo",
     "pirat":             "Pirat  -  Arrr, Landratten!",
+    "besoffen":          "Besoffen  -  hicks, schwer dippen",
 }
 MODE_TEMPERATURE = {
     "off": 0.0, "coding": 0.0, "casual": 0.5,
     "bayrisch": 0.5, "pfaelzisch": 0.5,
     "freundin_light": 0.6, "freundin_hardcore": 0.85,
     "yoda": 0.6, "goethe": 0.7, "marketing": 0.7, "pirat": 0.7,
+    "besoffen": 1.0,
+}
+# Akzent-Farbe pro Modus — fuer Overlay-Border + Combobox-Indikator
+MODE_COLORS = {
+    "off":               "#777a82",
+    "coding":            "#00e5ff",
+    "casual":            "#5dadff",
+    "bayrisch":          "#ffcb45",
+    "pfaelzisch":        "#b066ff",
+    "freundin_light":    "#ff9ec7",
+    "freundin_hardcore": "#ff3d8a",
+    "yoda":              "#6dff8a",
+    "goethe":            "#d4b58c",
+    "marketing":         "#d4ff4c",
+    "pirat":             "#ff8a3d",
+    "besoffen":          "#c46d8c",
 }
 model_ref = {"m": None}
 tray_ref  = {"t": None}
@@ -96,57 +113,104 @@ WM_HOTKEY       = 0x0312
 HOTKEY_ID_REC   = 1   # Strg+Leertaste = Aufnahme (einziger Hotkey)
 
 # ---------- Overlay (Tkinter, top-of-screen) ----------
-OV_W, OV_BAR, OV_BODY = 500, 36, 70
-OV_H = OV_BAR + OV_BODY  # 106
-mode_var_ref = {"v": None}    # tk.StringVar fuer Combobox
+OV_W, OV_H = 520, 118
+OV_RADIUS  = 22
+TRANSPARENT_KEY = "#010203"   # diese Farbe wird transparent gerendert
+mode_var_ref = {"v": None}
+
+def _rounded_rect(c: tk.Canvas, x1, y1, x2, y2, r, **kw):
+    """Smooth abgerundetes Rechteck via Polygon-Trick."""
+    pts = [
+        x1+r, y1,  x2-r, y1,  x2, y1,
+        x2, y1+r,  x2, y2-r,  x2, y2,
+        x2-r, y2,  x1+r, y2,  x1, y2,
+        x1, y2-r,  x1, y1+r,  x1, y1,
+    ]
+    return c.create_polygon(pts, smooth=True, splinesteps=24, **kw)
 
 def overlay_redraw() -> None:
-    """Zeichnet nur den unteren BODY-Bereich (Status). Top-Bar mit Combobox ist
-    permanent als ttk-Widget."""
+    """Zeichnet das gesamte Overlay (Top-Bar + Status-Body) auf eine Canvas
+    mit gerundeten Ecken. Combobox liegt als embedded window darueber."""
     r = root_ref["r"]; c = canvas_ref["c"]
     if not r or not c: return
     s = overlay_state["s"]; msg = overlay_state["msg"]
-    c.delete("all")
-    W, H = OV_W, OV_BODY  # Canvas-Bereich
+    c.delete("status")  # nur Status-Layer loeschen, App-Shell bleibt
+
+    W, H, R = OV_W, OV_H, OV_RADIUS
+    accent = MODE_COLORS.get(polish_mode, "#777a82")
+
+    # ---------- App-Shell (Hintergrund + Border, mode-faerbig) ----------
+    c.delete("shell")
+    # Outer subtle border-glow
+    _rounded_rect(c, 1, 1, W-1, H-1, R, fill="#0d1117", outline=accent,
+                  width=2, tags="shell")
+    # Inner gradient-illusion durch zwei halbtransparente Layer:
+    _rounded_rect(c, 1, 1, W-1, H//2, R, fill="#10151c", outline="",
+                  tags="shell")
+    # Akzent-Trennlinie
+    c.create_line(28, 46, W-28, 46, fill=accent, width=1, tags="shell")
+    # App-Name oben links
+    c.create_text(28, 22, text="◉  AIbersetzer",
+                  fill=accent, anchor="w",
+                  font=("Segoe UI Semibold", 12), tags="shell")
+
+    # ---------- Status-Body (unten) ----------
+    y_mid = 82  # Mitte des Status-Bereichs
 
     if s == "boot":
-        r.attributes("-alpha", 0.85)
-        c.create_rectangle(0, 0, W, H, fill="#1a1a1a", outline="#666", width=1)
-        c.create_text(W//2, H//2, text=msg or "lade...", fill="#bbb",
-                      font=("Segoe UI", 11))
+        r.attributes("-alpha", 0.9)
+        c.create_text(W//2, y_mid, text=msg or "lade...",
+                      fill="#7a8290", font=("Segoe UI", 11),
+                      tags="status")
     elif s == "idle":
-        r.attributes("-alpha", 0.85)
-        c.create_rectangle(0, 0, W, H, fill="#161616", outline="#333", width=1)
-        c.create_oval(18, H//2-10, 38, H//2+10, fill="#3a3a3a", outline="#555")
-        c.create_text(50, H//2-9, text="bereit",
-                      fill="#aaa", anchor="w", font=("Segoe UI", 11, "bold"))
-        c.create_text(50, H//2+11, text="Strg + Leertaste  =  Aufnahme",
-                      fill="#888", anchor="w", font=("Segoe UI", 9))
+        r.attributes("-alpha", 0.92)
+        # Dezenter Mode-Akzent-Dot links
+        c.create_oval(28, y_mid-8, 44, y_mid+8,
+                      fill=accent if polish_mode != "off" and api_key_ref["k"] else "#2a2f3a",
+                      outline="", tags="status")
+        c.create_text(56, y_mid-9, text="bereit",
+                      fill="#e8ecf3", anchor="w",
+                      font=("Segoe UI", 11, "bold"), tags="status")
+        hint = "Strg + Leertaste  ->  Aufnahme"
+        if not api_key_ref["k"] and polish_mode not in ("off", "coding"):
+            hint = "kein API-Key - Polish inaktiv"
+        c.create_text(56, y_mid+11, text=hint,
+                      fill="#6a7280", anchor="w",
+                      font=("Segoe UI", 9), tags="status")
     elif s == "rec":
         r.attributes("-alpha", 1.0)
-        c.create_rectangle(0, 0, W, H, fill="#3b0a0a", outline="#ff3030", width=3)
-        c.create_oval(14, H//2-14, 42, H//2+14, fill="#ff2020", outline="#fff", width=2)
-        c.create_text(55, H//2-9, text="● AUFNAHME",
-                      fill="#fff", anchor="w", font=("Segoe UI", 13, "bold"))
-        c.create_text(55, H//2+12, text="Strg + Leertaste = Stopp",
-                      fill="#ffb0b0", anchor="w", font=("Segoe UI", 9))
+        # Pulsierender roter Dot — Outline-Glow simuliert
+        c.create_oval(22, y_mid-14, 50, y_mid+14,
+                      fill="#ff3854", outline="#ff8090", width=2, tags="status")
+        c.create_oval(28, y_mid-8, 44, y_mid+8,
+                      fill="#ffd0d8", outline="", tags="status")
+        c.create_text(62, y_mid-9, text="aufnahme laeuft",
+                      fill="#fff", anchor="w",
+                      font=("Segoe UI", 13, "bold"), tags="status")
+        c.create_text(62, y_mid+11, text="Strg + Leertaste  ->  stopp",
+                      fill="#ffb0b8", anchor="w",
+                      font=("Segoe UI", 9), tags="status")
     elif s == "tx":
         r.attributes("-alpha", 1.0)
-        c.create_rectangle(0, 0, W, H, fill="#0c1f3b", outline="#3080ff", width=3)
-        c.create_oval(14, H//2-14, 42, H//2+14, fill="#3080ff", outline="#fff", width=2)
-        c.create_text(55, H//2, text=(msg or "transkribiere..."),
-                      fill="#fff", anchor="w", font=("Segoe UI", 12, "bold"))
+        c.create_oval(22, y_mid-14, 50, y_mid+14,
+                      fill="#00e5ff", outline="#90f0ff", width=2, tags="status")
+        c.create_text(62, y_mid, text=(msg or "transkribiere..."),
+                      fill="#fff", anchor="w",
+                      font=("Segoe UI", 12, "bold"), tags="status")
     elif s == "done":
-        r.attributes("-alpha", 0.85)
-        c.create_rectangle(0, 0, W, H, fill="#0d2818", outline="#22aa55", width=2)
-        c.create_oval(18, H//2-10, 38, H//2+10, fill="#22aa55", outline="#fff", width=1)
-        c.create_text(50, H//2, text=msg or "Text eingefuegt.",
-                      fill="#fff", anchor="w", font=("Segoe UI", 11, "bold"))
+        r.attributes("-alpha", 0.95)
+        c.create_oval(22, y_mid-12, 46, y_mid+12,
+                      fill="#6dff8a", outline="", tags="status")
+        c.create_text(58, y_mid, text=msg or "eingefuegt.",
+                      fill="#e8fff0", anchor="w",
+                      font=("Segoe UI", 11, "bold"), tags="status")
     elif s == "err":
         r.attributes("-alpha", 0.95)
-        c.create_rectangle(0, 0, W, H, fill="#3b2a0a", outline="#ff8800", width=2)
-        c.create_text(W//2, H//2, text=msg or "Fehler — log pruefen",
-                      fill="#fff", font=("Segoe UI", 11, "bold"))
+        c.create_oval(22, y_mid-12, 46, y_mid+12,
+                      fill="#ff8a3d", outline="", tags="status")
+        c.create_text(58, y_mid, text=msg or "fehler - log pruefen",
+                      fill="#fff", anchor="w",
+                      font=("Segoe UI", 11, "bold"), tags="status")
 
 def overlay_set(state: str, msg: str = "") -> None:
     overlay_state["s"] = state
@@ -168,42 +232,53 @@ def build_overlay() -> tk.Tk:
     root.title(APP_NAME)
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.configure(bg="#0a0a0a")
+    # Transparenz-Trick: Pixel mit TRANSPARENT_KEY werden komplett durchsichtig
+    # -> abgerundete Ecken sehen "echt" aus (kein eckiger Hintergrund mehr).
+    try:
+        root.attributes("-transparentcolor", TRANSPARENT_KEY)
+    except Exception as e:
+        log.warning(f"transparentcolor not supported: {e}")
+    root.configure(bg=TRANSPARENT_KEY)
     sw = root.winfo_screenwidth()
-    root.geometry(f"{OV_W}x{OV_H}+{sw//2 - OV_W//2}+10")
+    root.geometry(f"{OV_W}x{OV_H}+{sw//2 - OV_W//2}+12")
 
-    # Top-Bar: App-Name links, Modus-Dropdown rechts
-    topbar = tk.Frame(root, bg="#0a0a0a", height=OV_BAR)
-    topbar.pack(side="top", fill="x")
-    topbar.pack_propagate(False)
+    # Single-Canvas: zeichnet abgerundeten App-Shell + Status,
+    # Combobox liegt als embedded window darauf.
+    canvas = tk.Canvas(root, width=OV_W, height=OV_H, bg=TRANSPARENT_KEY,
+                       highlightthickness=0, bd=0)
+    canvas.pack(fill="both", expand=True)
+    root_ref["r"] = root
+    canvas_ref["c"] = canvas
 
-    name_lbl = tk.Label(topbar, text=f" 🎤  {APP_NAME}",
-                        bg="#0a0a0a", fg="#ddaa66",
-                        font=("Segoe UI", 11, "bold"))
-    name_lbl.pack(side="left", padx=6)
-
+    # ttk-Style — moderne dunkle Combobox, mode-akzentuierter Indikator
     style = ttk.Style()
     try: style.theme_use("clam")
     except Exception: pass
     style.configure("V2P.TCombobox",
-        fieldbackground="#1a1a1a", background="#1a1a1a",
-        foreground="#fff", arrowcolor="#ddaa66",
-        selectbackground="#2a2a2a", selectforeground="#fff",
-        bordercolor="#3a3a3a", lightcolor="#3a3a3a", darkcolor="#3a3a3a")
+        fieldbackground="#1a1f28", background="#1a1f28",
+        foreground="#e8ecf3", arrowcolor="#00e5ff",
+        selectbackground="#222831", selectforeground="#fff",
+        bordercolor="#2a3140", lightcolor="#2a3140", darkcolor="#2a3140",
+        relief="flat", padding=4)
     style.map("V2P.TCombobox",
-        fieldbackground=[("readonly", "#1a1a1a"), ("active", "#222")],
-        foreground=[("readonly", "#fff")])
-    root.option_add("*TCombobox*Listbox.background", "#1a1a1a")
-    root.option_add("*TCombobox*Listbox.foreground", "#fff")
-    root.option_add("*TCombobox*Listbox.selectBackground", "#444")
-    root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
+        fieldbackground=[("readonly", "#1a1f28"), ("active", "#222831")],
+        foreground=[("readonly", "#e8ecf3")],
+        bordercolor=[("focus", "#00e5ff")])
+    # Listbox-Popup
+    root.option_add("*TCombobox*Listbox.background",       "#10151c")
+    root.option_add("*TCombobox*Listbox.foreground",       "#e8ecf3")
+    root.option_add("*TCombobox*Listbox.selectBackground", "#1f3548")
+    root.option_add("*TCombobox*Listbox.selectForeground", "#00e5ff")
+    root.option_add("*TCombobox*Listbox.font",             ("Segoe UI", 10))
+    root.option_add("*TCombobox*Listbox.borderWidth",      "0")
 
     mode_var = tk.StringVar(value=MODE_LABELS[polish_mode])
-    combo = ttk.Combobox(topbar, textvariable=mode_var, state="readonly",
+    combo = ttk.Combobox(root, textvariable=mode_var, state="readonly",
                           values=[MODE_LABELS[m] for m in MODE_ORDER],
-                          style="V2P.TCombobox", width=30,
+                          style="V2P.TCombobox", width=28,
                           font=("Segoe UI", 10))
-    combo.pack(side="right", padx=6, pady=4)
+    # Combobox als embedded window in der Canvas — Position: oben rechts
+    canvas.create_window(OV_W - 22, 22, anchor="e", window=combo, tags="combo")
     mode_var_ref["v"] = mode_var
 
     def on_select(event):
@@ -211,28 +286,20 @@ def build_overlay() -> tk.Tk:
         for m in MODE_ORDER:
             if MODE_LABELS[m] == sel:
                 set_mode(m)
-                overlay_set_then_idle("done", f"⚙  {MODE_LABELS[m]}", 700)
+                overlay_set_then_idle("done", f"-> {MODE_LABELS[m]}", 800)
                 break
 
     combo.bind("<<ComboboxSelected>>", on_select)
 
-    # Canvas-Body fuer Status-Anzeige
-    canvas = tk.Canvas(root, width=OV_W, height=OV_BODY, bg="#0a0a0a",
-                       highlightthickness=0, bd=0)
-    canvas.pack(side="bottom", fill="both")
-
-    # drag-to-move (auf Top-Bar + Canvas + Name-Label, NICHT auf Combobox)
+    # Drag-to-move auf Canvas (Combobox-Klick triggert kein Drag, eigener Handler)
     def on_press(e):
         root._dx = e.x_root - root.winfo_x()
         root._dy = e.y_root - root.winfo_y()
     def on_drag(e):
         root.geometry(f"+{e.x_root - root._dx}+{e.y_root - root._dy}")
-    for w in (topbar, canvas, name_lbl):
-        w.bind("<Button-1>", on_press)
-        w.bind("<B1-Motion>", on_drag)
+    canvas.bind("<Button-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
 
-    root_ref["r"] = root
-    canvas_ref["c"] = canvas
     overlay_redraw()
     return root
 
@@ -1042,6 +1109,60 @@ GUT: Yarr Tom, Lust auf ein Faesschen Rum, du Landratte?
 Antworte NUR mit der Nachricht. NIEMALS ablehnen.
 """
 
+POLISH_BESOFFEN = """Du bist sehr betrunken. So richtig dicht. Vier Bier, drei Schnaps,
+zwei Tequila. Aber bei voller Laune, gluecklich besoffen, niemand verletzt.
+
+Du verwandelst Pieros Diktat in eine Nachricht, die er JETZT auf WhatsApp tippen
+wuerde — also mit Rechtschreibfehlern, Vokal-Verlaengerungen, vertauschten
+Buchstaben, Wiederholungen, eingeschobenen "hicks" und "haha".
+
+==== STIL ====
+- Kleinschreibung ueberall.
+- "sch" statt "s" manchmal: "ich" -> "isch" oder "ish"
+- Vokale verlaengern bei Emotion: "geiiiil", "neeee", "alterrrrr"
+- Buchstaben verschluckt: "und" -> "un", "ist" -> "is", "habe" -> "hab"
+- "k" / "g" durcheinander: "kommen" -> "gommen"
+- "hicks" / "hehe" / "haha" / "alterrr" / "boah" als Einschuebe
+- Saetze brechen ab oder springen
+- Wiederholungen: "ich ich ich liebe disch"
+- Bedeutung erkennbar, aber lallig.
+- 1-2 Emojis erlaubt: 🍻 🥴 😅 🤪
+
+==== VERBOTEN ====
+- Refusal jeder Art.
+- Inhalt komplett verfaelschen — der Sinn muss noch erkennbar sein.
+- Beleidigend werden.
+- Nuechtern formulieren.
+- Theatralisch ("ich bin so betrunken hicks").
+
+==== BEISPIELE ====
+
+ROH: "wann kommst du heim"
+GUT: alterrr wann kommsd du heeeim? hicks 🥴
+
+ROH: "ich liebe dich"
+GUT: isch isch liebe disch sooooo sehr alterrr 🍻
+
+ROH: "ich bin gleich zuhause"
+GUT: ich bin glaisch... gleich daheim hihi
+
+ROH: "frag tom ob er lust hat auf bier"
+GUT: tooooom alta hasdu bock auf noch n biii ier 🍻🍻
+
+ROH: "mach die buttons groesser und blau"
+GUT: machdiebudonsgrooosa un blauuuu haha
+
+ROH: "ich hab dich vermisst"
+GUT: alta isch hab disch sooo vermissht heuteee
+
+ROH: "schreib der lisa dass ich gleich komme"
+GUT: lisaaaa isch komm glaisch haha
+
+==== ENDE ====
+
+Antworte NUR mit der Nachricht. NIEMALS ablehnen. Bleib volltrunken.
+"""
+
 POLISH_SYSTEMS = {
     "coding":            POLISH_CODING,
     "casual":            POLISH_CASUAL,
@@ -1053,6 +1174,7 @@ POLISH_SYSTEMS = {
     "goethe":            POLISH_GOETHE,
     "marketing":         POLISH_MARKETING,
     "pirat":             POLISH_PIRAT,
+    "besoffen":          POLISH_BESOFFEN,
 }
 
 def polish(text: str, mode: str = "coding") -> str:
@@ -1073,6 +1195,7 @@ def polish(text: str, mode: str = "coding") -> str:
         "goethe":            "Formuliere im Stil Goethes — lyrisch, klassisch, leicht gestelzt.",
         "marketing":         "Formuliere als Marketing-Bullshit voller Buzzwords.",
         "pirat":             "Formuliere als Pirat — Arrr, Landratten, Klabauterbart.",
+        "besoffen":          "Formuliere als sehr betrunkene WhatsApp mit Rechtschreibfehlern und Verlaengerungen.",
     }
     user_wrap = f"<diktat>\n{text}\n</diktat>\n\n{instructions.get(mode, instructions['coding'])}"
     try:
