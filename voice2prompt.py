@@ -21,17 +21,12 @@ import logging
 import ctypes
 from ctypes import wintypes
 
+import json
 import numpy as np
 import sounddevice as sd
 import keyboard          # nur fuer keyboard.send("ctrl+v") — Paste-Senden
 import pyperclip
-import tkinter as tk
-from tkinter import ttk
-import customtkinter as ctk
-try:
-    import pywinstyles
-except ImportError:
-    pywinstyles = None
+import webview
 from PIL import Image, ImageDraw
 import pystray
 from faster_whisper import WhisperModel
@@ -135,316 +130,424 @@ VK_SPACE        = 0x20
 WM_HOTKEY       = 0x0312
 HOTKEY_ID_REC   = 1   # Strg+Leertaste = Aufnahme (einziger Hotkey)
 
-# ---------- Overlay (CustomTkinter, native Acrylic via pywinstyles) ----------
-# Modernes Layout: groesserer Radius, transparente Ecken (Color-Key auf Windows),
-# generoeses Padding, Segoe UI Variable als Typo.
-OV_W, OV_H = 600, 172
-pulse_phase  = {"p": 0}
+# ---------- Overlay (pywebview, modernes HTML/CSS-UI mit Glassmorphism) ----------
+# UI rendert in Edge WebView2 (Windows-native). Inter Variable Font via Google
+# Fonts CDN, falls offline → Fallback Segoe UI Variable. Python<->JS Bridge via
+# pywebview.api.
+OV_W, OV_H = 660, 200
 
-# Color-Key fuer transparente Ecken: dieser exotische Farbton wird vom OS
-# als Alpha=0 gerendert, sodass das Tk-Rechteck hinter dem abgerundeten
-# CTkFrame verschwindet. Darf NIRGENDS sonst in der UI vorkommen.
-TRANSPARENT_KEY = "#010203"
-
-# Design-Tokens — eine zentrale Palette statt Hex-Streuung.
-COL_BG_SURFACE   = "#0e141d"   # Hauptflaeche
-COL_BG_RAISED    = "#161e29"   # Dropdown / Pill / Hover
-COL_BG_RAISED_HI = "#1d2734"   # Hover-State
-COL_BG_DIVIDER   = "#1a2230"   # zarte Trennung (selten benutzt)
-COL_FG_PRIMARY   = "#f1f4f9"   # primaerer Text
-COL_FG_SECONDARY = "#8a93a4"   # subtiler Text
-COL_FG_MUTED     = "#5a6478"   # noch dezenter
-
-# CTk-Widget-Referenzen
-ctk_refs = {
-    "shell": None,        # outer CTkFrame (rounded, kein Border)
-    "header": None,       # header CTkFrame
-    "body": None,         # status-body CTkFrame
-    "name_lbl": None,     # "AIbersetzer"
-    "subtitle": None,     # "Sprache → Text"
-    "mode_btn": None,     # CTkOptionMenu
-    "status_dot": None,   # CTkLabel mit ● dot
-    "status_main": None,  # main status text
-    "status_sub": None,   # sub status text
-    "accent_bar": None,   # 3px Akzent-Streifen links
-}
-
-ctk.set_appearance_mode("dark")
-
-# Wird in build_overlay() auf Segoe UI Variable / Inter / Segoe UI gesetzt.
-FONT_FAMILY = {"display": "Segoe UI", "text": "Segoe UI"}
-
-def _detect_fonts() -> None:
-    """Bevorzugt Win11-native Segoe UI Variable, dann Inter, dann Segoe UI."""
-    try:
-        import tkinter.font as tkfont
-        avail = set(tkfont.families())
-        for f in ("Segoe UI Variable Display", "Inter Display", "Segoe UI Variable", "Inter", "Segoe UI"):
-            if f in avail:
-                FONT_FAMILY["display"] = f; break
-        for f in ("Segoe UI Variable Text", "Inter", "Segoe UI Variable", "Segoe UI"):
-            if f in avail:
-                FONT_FAMILY["text"] = f; break
-    except Exception as e:
-        log.warning(f"font detect failed: {e}")
-
-STATUS_COLORS = {
-    "boot":  ("#7a8290",  "#10151c"),
-    "idle":  ("#e8ecf3",  "#2a3548"),
-    "rec":   ("#ffffff",  "#ff3854"),
-    "tx":    ("#ffffff",  "#00e5ff"),
-    "done":  ("#e8fff0",  "#6dff8a"),
-    "err":   ("#ffffff",  "#ff8a3d"),
-}
+window_ref = {"w": None}
 
 def _short_preview(text: str, n: int = 42) -> str:
     return text if len(text) <= n else text[:n-1] + "…"
 
+def _js_eval(code: str) -> None:
+    """Sicher JS im WebView ausfuehren — kein Crash bei kein-Window-da."""
+    w = window_ref["w"]
+    if not w:
+        return
+    try:
+        w.evaluate_js(code)
+    except Exception as e:
+        log.warning(f"js_eval failed: {e}")
+
 def overlay_redraw() -> None:
-    """Aktualisiert die CTk-Widgets je nach overlay_state."""
-    if not ctk_refs["shell"]:
-        return
+    """Pusht den aktuellen overlay_state in die UI."""
     s = overlay_state["s"]; msg = overlay_state["msg"]
-    accent = MODE_COLORS.get(polish_mode, COL_FG_SECONDARY)
-
-    # Akzent-Streifen + App-Name in Mode-Akzentfarbe
-    try:
-        if ctk_refs["accent_bar"]:
-            ctk_refs["accent_bar"].configure(fg_color=accent)
-    except Exception: pass
-    try:
-        ctk_refs["name_lbl"].configure(text_color=COL_FG_PRIMARY)
-    except Exception: pass
-
-    # Status-Bereich
-    main_text = sub_text = dot_color = None
-    if s == "boot":
-        main_text = msg or "Wird geladen…"
-        sub_text  = "Modell wird vorbereitet"
-        dot_color = COL_FG_MUTED
-    elif s == "idle":
-        main_text = "Bereit"
-        if not api_key_ref["k"] and polish_mode not in ("off", "coding"):
-            sub_text = "Kein API-Key — Polish inaktiv"
-        else:
-            sub_text = "Strg + Leertaste  →  Aufnahme"
-        dot_color = accent if polish_mode != "off" else COL_FG_MUTED
-    elif s == "rec":
-        main_text = "Aufnahme läuft"
-        sub_text  = "Strg + Leertaste  →  Stopp"
-        dot_color = "#ff3854"
-    elif s == "tx":
-        main_text = msg or "Wird transkribiert…"
-        sub_text  = " "
-        dot_color = "#00e5ff"
-    elif s == "done":
-        main_text = msg or "Eingefügt."
-        sub_text  = " "
-        dot_color = "#6dff8a"
-    elif s == "err":
-        main_text = msg or "Fehler – Log prüfen"
-        sub_text  = " "
-        dot_color = "#ff8a3d"
-
-    try:
-        ctk_refs["status_main"].configure(text=main_text)
-        ctk_refs["status_sub"].configure(text=sub_text)
-        ctk_refs["status_dot"].configure(text_color=dot_color)
-    except Exception: pass
-
-def pulse_tick() -> None:
-    """Pulsiert den Akzent-Streifen waehrend Recording/Transcribing — subtil."""
-    r = root_ref["r"]
-    bar = ctk_refs["accent_bar"]
-    if not r or not bar:
-        return
-    s = overlay_state["s"]
-    if s in ("rec", "tx"):
-        pulse_phase["p"] = 1 - pulse_phase["p"]
-        if s == "rec":
-            cols = ("#ff3854", "#ff8aa0")
-        else:
-            cols = ("#00e5ff", "#80f0ff")
-        try:
-            bar.configure(fg_color=cols[pulse_phase["p"]])
-        except Exception:
-            pass
-    try:
-        r.after(420, pulse_tick)
-    except Exception:
-        pass
+    no_key_msg = ""
+    if s == "idle" and not api_key_ref["k"] and polish_mode not in ("off", "coding"):
+        no_key_msg = "Kein API-Key — Polish inaktiv"
+    payload = {"state": s, "msg": msg, "mode": polish_mode, "noKeyMsg": no_key_msg}
+    _js_eval(f"window.v2p && window.v2p.setState({json.dumps(payload, ensure_ascii=False)})")
 
 def overlay_set(state: str, msg: str = "") -> None:
     overlay_state["s"] = state
     overlay_state["msg"] = msg
-    r = root_ref["r"]
-    if r:
-        try: r.after(0, overlay_redraw)
-        except Exception: pass
+    overlay_redraw()
 
 def overlay_set_then_idle(state: str, msg: str, after_ms: int) -> None:
     overlay_set(state, msg)
-    r = root_ref["r"]
-    if r:
-        try: r.after(after_ms, lambda: overlay_set("idle"))
-        except Exception: pass
+    def revert():
+        time.sleep(max(0.0, after_ms / 1000.0))
+        overlay_set("idle")
+    threading.Thread(target=revert, daemon=True).start()
 
-def build_overlay() -> ctk.CTk:
-    root = ctk.CTk()
-    root.title(APP_NAME)
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    sw = root.winfo_screenwidth()
-    root.geometry(f"{OV_W}x{OV_H}+{sw//2 - OV_W//2}+12")
+# HTML/CSS-UI — rendert in Edge WebView2. Glassmorphism, Inter Variable Font,
+# custom Dropdown mit Mode-Dots, smooth CSS-Animationen.
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>AIbersetzer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-surface: rgba(13, 17, 25, 0.82);
+    --bg-raised: rgba(255, 255, 255, 0.05);
+    --bg-raised-hi: rgba(255, 255, 255, 0.10);
+    --bg-menu: rgba(18, 23, 32, 0.94);
+    --fg-primary: #f3f5f9;
+    --fg-secondary: #98a0af;
+    --fg-muted: #5d6678;
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.12);
+    --accent: __INITIAL_COLOR__;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100vw; height: 100vh;
+    background: transparent;
+    font-family: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv11', 'ss01';
+    -webkit-font-smoothing: antialiased;
+    color: var(--fg-primary);
+    overflow: hidden;
+    user-select: none;
+  }
+  .shell {
+    position: relative;
+    margin: 16px;
+    height: calc(100vh - 32px);
+    border-radius: 24px;
+    background: var(--bg-surface);
+    backdrop-filter: blur(40px) saturate(180%);
+    -webkit-backdrop-filter: blur(40px) saturate(180%);
+    border: 1px solid var(--border-subtle);
+    box-shadow:
+      0 32px 64px -16px rgba(0, 0, 0, 0.7),
+      0 0 0 1px rgba(255, 255, 255, 0.04) inset,
+      0 1px 0 0 rgba(255, 255, 255, 0.06) inset;
+    overflow: visible;
+    -webkit-app-region: drag;
+  }
+  .accent-stripe {
+    position: absolute;
+    top: 20px; bottom: 20px;
+    left: 0;
+    width: 3px;
+    background: var(--accent);
+    border-radius: 0 2px 2px 0;
+    box-shadow: 0 0 18px var(--accent);
+    opacity: 0.7;
+    transition: background 0.4s, box-shadow 0.4s, opacity 0.3s;
+  }
+  .shell.rec .accent-stripe { background: #ff3854; box-shadow: 0 0 28px #ff3854; animation: stripe-pulse 1.4s infinite ease-in-out; }
+  .shell.tx  .accent-stripe { background: #00e5ff; box-shadow: 0 0 28px #00e5ff; animation: stripe-pulse 1.0s infinite ease-in-out; }
+  @keyframes stripe-pulse {
+    0%, 100% { opacity: 0.7; }
+    50% { opacity: 0.25; }
+  }
+  .header {
+    padding: 22px 26px 0 30px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .brand h1 {
+    font-size: 19px; font-weight: 700;
+    letter-spacing: -0.025em;
+    color: var(--fg-primary);
+    line-height: 1.05;
+    display: flex; align-items: baseline; gap: 1px;
+  }
+  .brand h1 .ai {
+    color: var(--accent);
+    font-weight: 700;
+    transition: color 0.3s, text-shadow 0.3s;
+    text-shadow: 0 0 18px color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  .brand p {
+    font-size: 11px; font-weight: 500;
+    color: var(--fg-muted);
+    margin-top: 4px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .mode-picker { position: relative; -webkit-app-region: no-drag; }
+  .mode-btn {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    color: var(--fg-primary);
+    font: 600 12px 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: background 0.18s, border-color 0.18s, transform 0.1s;
+    min-width: 240px;
+  }
+  .mode-btn:hover { background: var(--bg-raised-hi); border-color: var(--border-strong); }
+  .mode-btn:active { transform: scale(0.98); }
+  .mode-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+    transition: background 0.3s, box-shadow 0.3s;
+    flex-shrink: 0;
+  }
+  .mode-label { flex: 1; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mode-caret { font-size: 9px; opacity: 0.6; transition: transform 0.22s; }
+  .mode-picker.open .mode-caret { transform: rotate(180deg); }
+  .mode-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    min-width: 280px;
+    background: var(--bg-menu);
+    backdrop-filter: blur(40px) saturate(180%);
+    -webkit-backdrop-filter: blur(40px) saturate(180%);
+    border: 1px solid var(--border-subtle);
+    border-radius: 14px;
+    padding: 6px;
+    box-shadow: 0 20px 48px -8px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+    opacity: 0;
+    transform: translateY(-6px) scale(0.97);
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    max-height: 380px;
+    overflow-y: auto;
+    z-index: 100;
+  }
+  .mode-picker.open .mode-menu { opacity: 1; transform: none; pointer-events: auto; }
+  .mode-item {
+    display: flex; align-items: center; gap: 11px;
+    padding: 9px 12px;
+    border-radius: 9px;
+    cursor: pointer;
+    font: 500 12px/1.2 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    color: var(--fg-primary);
+    transition: background 0.12s;
+    position: relative;
+  }
+  .mode-item:hover { background: rgba(255, 255, 255, 0.05); }
+  .mode-item.active { background: rgba(255, 255, 255, 0.04); }
+  .mode-item.active::after {
+    content: '';
+    position: absolute;
+    right: 12px;
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: var(--fg-secondary);
+  }
+  .mode-item .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    flex-shrink: 0;
+    box-shadow: 0 0 8px currentColor;
+  }
+  .body {
+    padding: 14px 30px 22px 30px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .status-dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 12px currentColor;
+    color: var(--accent);
+    transition: background 0.3s, box-shadow 0.3s, color 0.3s;
+    flex-shrink: 0;
+    position: relative;
+  }
+  .shell.boot .status-dot { background: var(--fg-muted); color: var(--fg-muted); }
+  .status-dot::before {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    border: 1.5px solid currentColor;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .shell.rec .status-dot { background: #ff3854; color: #ff3854; animation: dot-pulse 1.2s infinite ease-in-out; }
+  .shell.rec .status-dot::before { opacity: 0.5; animation: dot-ring 1.2s infinite ease-in-out; }
+  .shell.tx  .status-dot { background: #00e5ff; color: #00e5ff; animation: dot-pulse 0.8s infinite ease-in-out; }
+  .shell.tx  .status-dot::before { opacity: 0.5; animation: dot-ring 0.8s infinite ease-in-out; }
+  .shell.done .status-dot { background: #6dff8a; color: #6dff8a; }
+  .shell.err .status-dot { background: #ff8a3d; color: #ff8a3d; }
+  @keyframes dot-pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.2); }
+  }
+  @keyframes dot-ring {
+    0% { transform: scale(0.8); opacity: 0.6; }
+    100% { transform: scale(1.8); opacity: 0; }
+  }
+  .status-text { flex: 1; min-width: 0; }
+  .status-main {
+    font: 600 15px 'Inter', sans-serif;
+    letter-spacing: -0.015em;
+    color: var(--fg-primary);
+    line-height: 1.2;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .status-sub {
+    font: 400 11px/1.4 'Inter', sans-serif;
+    color: var(--fg-secondary);
+    margin-top: 4px;
+    letter-spacing: 0.005em;
+  }
+  .status-sub kbd {
+    font: 600 10px 'Inter', sans-serif;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    padding: 2px 6px;
+    border-radius: 5px;
+    color: var(--fg-primary);
+    margin: 0 1px;
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 1px 2px rgba(0, 0, 0, 0.3);
+  }
+  .mode-menu::-webkit-scrollbar { width: 6px; }
+  .mode-menu::-webkit-scrollbar-track { background: transparent; }
+  .mode-menu::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 3px; }
+  .mode-menu::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
+</style>
+</head>
+<body>
+  <div class="shell idle" id="shell">
+    <div class="accent-stripe" id="accent-stripe"></div>
+    <div class="header">
+      <div class="brand">
+        <h1><span class="ai">AI</span>bersetzer</h1>
+        <p>Sprache zu Text</p>
+      </div>
+      <div class="mode-picker" id="mode-picker">
+        <button class="mode-btn" id="mode-btn" type="button">
+          <span class="mode-dot" id="mode-dot"></span>
+          <span class="mode-label" id="mode-label">__INITIAL_LABEL__</span>
+          <span class="mode-caret">▼</span>
+        </button>
+        <div class="mode-menu" id="mode-menu"></div>
+      </div>
+    </div>
+    <div class="body">
+      <div class="status-dot" id="status-dot"></div>
+      <div class="status-text">
+        <div class="status-main" id="status-main">Bereit</div>
+        <div class="status-sub" id="status-sub"><kbd>Strg</kbd>+<kbd>Leer</kbd>&nbsp;&nbsp;→&nbsp;&nbsp;Aufnahme</div>
+      </div>
+    </div>
+  </div>
+<script>
+  const MODES = __MODES_JSON__;
+  let currentMode = '__INITIAL_MODE__';
+  const $shell = document.getElementById('shell');
+  const $modePicker = document.getElementById('mode-picker');
+  const $modeBtn = document.getElementById('mode-btn');
+  const $modeDot = document.getElementById('mode-dot');
+  const $modeLabel = document.getElementById('mode-label');
+  const $modeMenu = document.getElementById('mode-menu');
+  const $statusMain = document.getElementById('status-main');
+  const $statusSub = document.getElementById('status-sub');
 
-    # Moderne Typografie: Segoe UI Variable / Inter / Segoe UI auto-detect.
-    _detect_fonts()
-    FAM_D = FONT_FAMILY["display"]
-    FAM_T = FONT_FAMILY["text"]
+  function renderMenu() {
+    $modeMenu.innerHTML = MODES.map(m => `
+      <div class="mode-item ${m.key === currentMode ? 'active' : ''}" data-key="${m.key}">
+        <span class="dot" style="background:${m.color}; color:${m.color}"></span>
+        <span>${m.label}</span>
+      </div>`).join('');
+    $modeMenu.querySelectorAll('.mode-item').forEach(el => {
+      el.addEventListener('click', () => {
+        const k = el.dataset.key;
+        applyMode(k);
+        $modePicker.classList.remove('open');
+        if (window.pywebview && window.pywebview.api && window.pywebview.api.set_mode) {
+          window.pywebview.api.set_mode(k);
+        }
+      });
+    });
+  }
+  function applyMode(key) {
+    const m = MODES.find(x => x.key === key);
+    if (!m) return;
+    currentMode = key;
+    $modeLabel.textContent = m.label;
+    document.documentElement.style.setProperty('--accent', m.color);
+    $modeDot.style.background = m.color;
+    $modeDot.style.boxShadow = `0 0 10px ${m.color}`;
+    renderMenu();
+  }
+  $modeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    $modePicker.classList.toggle('open');
+  });
+  document.addEventListener('click', () => $modePicker.classList.remove('open'));
 
-    # Color-Key fuer echte runde Ecken: Tk-Hintergrund auf TRANSPARENT_KEY,
-    # OS rendert diese Farbe als Alpha=0 → schwarze Ecken verschwinden.
-    try:
-        root.configure(bg=TRANSPARENT_KEY)
-        root.wm_attributes("-transparentcolor", TRANSPARENT_KEY)
-    except Exception as e:
-        log.warning(f"transparentcolor failed: {e}")
+  window.v2p = {
+    setState(payload) {
+      const { state, msg, mode, noKeyMsg } = payload;
+      ['rec', 'tx', 'done', 'err', 'boot', 'idle'].forEach(s => $shell.classList.remove(s));
+      $shell.classList.add(state);
+      if (mode && mode !== currentMode) applyMode(mode);
+      let main = '', sub = '';
+      if (state === 'boot')      { main = msg || 'Wird geladen…'; sub = 'Modell wird vorbereitet'; }
+      else if (state === 'idle') {
+        main = 'Bereit';
+        sub = noKeyMsg || '<kbd>Strg</kbd>+<kbd>Leer</kbd>&nbsp;&nbsp;→&nbsp;&nbsp;Aufnahme';
+      }
+      else if (state === 'rec')  { main = 'Aufnahme läuft'; sub = '<kbd>Strg</kbd>+<kbd>Leer</kbd>&nbsp;&nbsp;→&nbsp;&nbsp;Stopp'; }
+      else if (state === 'tx')   { main = msg || 'Wird transkribiert…'; sub = ' '; }
+      else if (state === 'done') { main = msg || 'Eingefügt'; sub = ' '; }
+      else if (state === 'err')  { main = msg || 'Fehler – Log prüfen'; sub = ' '; }
+      $statusMain.textContent = main;
+      $statusSub.innerHTML = sub;
+    },
+    setMode(key) { applyMode(key); }
+  };
 
-    # Native Mica/Acrylic-Backdrop (Windows 11) via pywinstyles, optional.
-    if pywinstyles:
+  renderMenu();
+  applyMode(currentMode);
+</script>
+</body>
+</html>
+"""
+
+def _build_html() -> str:
+    modes = [{"key": k, "label": MODE_LABELS[k], "color": MODE_COLORS[k]} for k in MODE_ORDER]
+    return (HTML_TEMPLATE
+        .replace("__MODES_JSON__", json.dumps(modes, ensure_ascii=False))
+        .replace("__INITIAL_MODE__", polish_mode)
+        .replace("__INITIAL_LABEL__", MODE_LABELS[polish_mode])
+        .replace("__INITIAL_COLOR__", MODE_COLORS[polish_mode])
+    )
+
+class JsAPI:
+    """Bridge: JS -> Python."""
+    def set_mode(self, key: str) -> None:
+        if key in MODE_LABELS:
+            set_mode(key)
+            overlay_set_then_idle("done", f"→ {MODE_LABELS[key]}", 700)
+
+def build_overlay():
+    """Erstellt das pywebview-Window. Muss VOR webview.start() aufgerufen werden."""
+    api = JsAPI()
+    win = webview.create_window(
+        APP_NAME,
+        html=_build_html(),
+        js_api=api,
+        frameless=True,
+        transparent=True,
+        on_top=True,
+        width=OV_W,
+        height=OV_H,
+        resizable=False,
+    )
+    window_ref["w"] = win
+
+    # Beim Loaded-Event den aktuellen State pushen (initial render).
+    def on_loaded():
         try:
-            pywinstyles.apply_style(root, "dark")
+            overlay_redraw()
         except Exception as e:
-            log.warning(f"pywinstyles: {e}")
-
-    # Outer Shell — abgerundeter CTkFrame, kein Border (modern: Tint statt Linie).
-    shell = ctk.CTkFrame(
-        root,
-        fg_color=COL_BG_SURFACE,
-        border_width=0,
-        corner_radius=28,
-    )
-    shell.pack(fill="both", expand=True, padx=2, pady=2)
-    ctk_refs["shell"] = shell
-    root_ref["r"] = root
-
-    # Schmaler Akzent-Streifen oben — pulsiert bei rec/tx, sonst Mode-Farbe.
-    accent_bar = ctk.CTkFrame(
-        shell, fg_color=MODE_COLORS.get(polish_mode, COL_FG_MUTED),
-        height=3, corner_radius=2,
-    )
-    accent_bar.pack(fill="x", padx=22, pady=(10, 0))
-    ctk_refs["accent_bar"] = accent_bar
-
-    # ---------- Header ----------
-    header = ctk.CTkFrame(shell, fg_color="transparent", height=58)
-    header.pack(fill="x", padx=26, pady=(14, 0))
-    header.pack_propagate(False)
-    ctk_refs["header"] = header
-
-    name_frame = ctk.CTkFrame(header, fg_color="transparent")
-    name_frame.pack(side="left", anchor="w")
-    name_lbl = ctk.CTkLabel(
-        name_frame, text="AIbersetzer",
-        font=ctk.CTkFont(FAM_D, 19, weight="bold"),
-        text_color=COL_FG_PRIMARY,
-    )
-    name_lbl.pack(anchor="w", pady=(0, 0))
-    sub_lbl = ctk.CTkLabel(
-        name_frame, text="Sprache → Text",
-        font=ctk.CTkFont(FAM_T, 10),
-        text_color=COL_FG_MUTED,
-    )
-    sub_lbl.pack(anchor="w", pady=(2, 0))
-    ctk_refs["name_lbl"] = name_lbl
-    ctk_refs["subtitle"] = sub_lbl
-
-    # ---------- Mode-Picker (Pill-Form, Akzent als linker Button) ----------
-    def on_mode_select(choice: str):
-        for m in MODE_ORDER:
-            if MODE_LABELS[m] == choice:
-                set_mode(m)
-                col = MODE_COLORS.get(m, "#00e5ff")
-                try:
-                    ctk_refs["mode_btn"].configure(button_color=col, button_hover_color=col)
-                except Exception: pass
-                try:
-                    if ctk_refs["accent_bar"]:
-                        ctk_refs["accent_bar"].configure(fg_color=col)
-                except Exception: pass
-                overlay_set_then_idle("done", f"→  {MODE_LABELS[m]}", 700)
-                break
-
-    mode_btn = ctk.CTkOptionMenu(
-        header,
-        values=[MODE_LABELS[m] for m in MODE_ORDER],
-        command=on_mode_select,
-        width=252, height=38,
-        corner_radius=19,
-        font=ctk.CTkFont(FAM_T, 12, weight="bold"),
-        dropdown_font=ctk.CTkFont(FAM_T, 11),
-        fg_color=COL_BG_RAISED,
-        button_color=MODE_COLORS.get(polish_mode, "#00e5ff"),
-        button_hover_color=MODE_COLORS.get(polish_mode, "#00e5ff"),
-        text_color=COL_FG_PRIMARY,
-        dropdown_fg_color=COL_BG_SURFACE,
-        dropdown_hover_color=COL_BG_RAISED_HI,
-        dropdown_text_color=COL_FG_PRIMARY,
-        anchor="w",
-    )
-    mode_btn.set(MODE_LABELS[polish_mode])
-    mode_btn.pack(side="right")
-    ctk_refs["mode_btn"] = mode_btn
-
-    # ---------- Status-Body (Whitespace statt Trennlinie) ----------
-    body = ctk.CTkFrame(shell, fg_color="transparent")
-    body.pack(fill="both", expand=True, padx=26, pady=(8, 18))
-    ctk_refs["body"] = body
-
-    status_row = ctk.CTkFrame(body, fg_color="transparent")
-    status_row.pack(anchor="w", pady=(8, 0))
-
-    dot_lbl = ctk.CTkLabel(
-        status_row, text="●",
-        font=ctk.CTkFont(FAM_D, 24),
-        text_color=COL_FG_MUTED, width=22,
-    )
-    dot_lbl.pack(side="left", padx=(0, 14))
-    ctk_refs["status_dot"] = dot_lbl
-
-    text_frame = ctk.CTkFrame(status_row, fg_color="transparent")
-    text_frame.pack(side="left")
-
-    main_lbl = ctk.CTkLabel(
-        text_frame, text="Bereit",
-        font=ctk.CTkFont(FAM_D, 15, weight="bold"),
-        text_color=COL_FG_PRIMARY, anchor="w",
-    )
-    main_lbl.pack(anchor="w")
-    sub_status = ctk.CTkLabel(
-        text_frame, text="Strg + Leertaste  →  Aufnahme",
-        font=ctk.CTkFont(FAM_T, 10),
-        text_color=COL_FG_SECONDARY, anchor="w",
-    )
-    sub_status.pack(anchor="w", pady=(2, 0))
-    ctk_refs["status_main"] = main_lbl
-    ctk_refs["status_sub"] = sub_status
-
-    # ---------- Drag-to-move (shell + header-Bereiche, nicht Dropdown) ----------
-    def on_press(e):
-        root._dx = e.x_root - root.winfo_x()
-        root._dy = e.y_root - root.winfo_y()
-    def on_drag(e):
-        root.geometry(f"+{e.x_root - root._dx}+{e.y_root - root._dy}")
-    for w in (shell, header, name_frame, name_lbl, sub_lbl, body, status_row,
-              dot_lbl, text_frame, main_lbl, sub_status, accent_bar):
-        try:
-            w.bind("<Button-1>",  on_press)
-            w.bind("<B1-Motion>", on_drag)
-        except Exception: pass
-
-    overlay_redraw()
-    return root
+            log.warning(f"on_loaded redraw: {e}")
+    try:
+        win.events.loaded += on_loaded
+    except Exception as e:
+        log.warning(f"loaded event hook failed: {e}")
+    return win
 
 # ---------- Audio ----------
 def audio_callback(indata, frames, t_, status) -> None:
@@ -1825,9 +1928,10 @@ def main() -> None:
     load_api_key()
     log.info(f"polish: {'AKTIV (Claude '+POLISH_MODEL+')' if api_key_ref['k'] else 'AUS (kein API-Key)'}")
 
-    root = build_overlay()
-    root.after(500, pulse_tick)
+    # WebView-Fenster bauen (blockt nicht — startet erst bei webview.start()).
+    build_overlay()
 
+    # Background-Threads: Tray, Audio, Model-Loader, Hotkey.
     threading.Thread(target=run_tray, daemon=True).start()
     threading.Thread(target=audio_runner, daemon=True).start()
 
@@ -1843,8 +1947,9 @@ def main() -> None:
 
     threading.Thread(target=hotkey_loop, daemon=True).start()
 
+    # WebView starten — blockt bis Window geschlossen / app beendet.
     try:
-        root.mainloop()
+        webview.start(gui="edgechromium", debug=False)
     except KeyboardInterrupt:
         pass
     log.info(f"=== {APP_NAME} stop ===")

@@ -2,6 +2,38 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-06-06 – UI komplett neu: WebView statt Tkinter (echtes 2026er Design)
+
+**Was war kaputt:**
+CustomTkinter war auch mit Polish noch Windows-XP-Charme: klobiges Dropdown,
+schwarze Ecken-Halos durch Color-Key-Antialias, keine echten Animationen,
+keine Glassmorphism. Tkinter ist 1992er-Architektur, da hilft kein Lipstick.
+
+**Was jetzt anders ist:**
+
+- **Tkinter komplett raus.** Das UI rendert jetzt in **Edge WebView2** (in
+  Windows 11 vorinstalliert) via `pywebview`. Das ist die gleiche Engine wie
+  in Chrome — volles modernes CSS, GPU-beschleunigt.
+- **Glassmorphism**: `backdrop-filter: blur(40px) saturate(180%)` mit
+  semitransparentem Surface (rgba 0.82) — der Desktop scheint subtle durch.
+- **Inter Variable Font** über Google Fonts (Fallback: Segoe UI Variable) —
+  die de-facto Standard-Schrift moderner Web-Apps in 2025/26.
+- **Custom Dropdown** mit Mode-Color-Dots pro Eintrag, smooth slide-down
+  Animation, glassmorphem Hintergrund, sauberen Hover-States, Active-Indicator.
+- **KBD-Style Tasten** für Hotkey-Hinweise (Strg + Leer) — wie moderne SaaS-Apps.
+- **CSS-Animationen**: Status-Dot pulsiert bei rec/tx mit ring-ripple,
+  Accent-Stripe links pulsiert subtil, smooth color-transitions bei Mode-Wechsel.
+- **App-Name mit Akzent-Hervorhebung**: "AI" leuchtet in Mode-Farbe, Rest
+  bleibt weiß — sieht wie ein modernes Logo aus.
+- **Drag-to-move** via CSS (`-webkit-app-region: drag`), Dropdown bleibt
+  klickbar.
+- **Python↔JS Bridge**: Mode-Wechsel von JS → Python via `pywebview.api`,
+  State-Updates von Python → JS via `evaluate_js`. Alle anderen Sachen
+  (Audio, Whisper, Hotkey, Tray, Polish) bleiben unverändert.
+
+**Entfallene Dependencies:** `tkinter`, `customtkinter`, `pywinstyles` —
+neu hinzu: `pywebview` (~5MB, einmalig).
+
 ## 2026-06-06 – UI-Redesign (modern, abgerundet, transparent)
 
 **Was war kaputt:**
