@@ -136,28 +136,60 @@ WM_HOTKEY       = 0x0312
 HOTKEY_ID_REC   = 1   # Strg+Leertaste = Aufnahme (einziger Hotkey)
 
 # ---------- Overlay (CustomTkinter, native Acrylic via pywinstyles) ----------
-OV_W, OV_H = 560, 138
+# Modernes Layout: groesserer Radius, transparente Ecken (Color-Key auf Windows),
+# generoeses Padding, Segoe UI Variable als Typo.
+OV_W, OV_H = 600, 172
 pulse_phase  = {"p": 0}
+
+# Color-Key fuer transparente Ecken: dieser exotische Farbton wird vom OS
+# als Alpha=0 gerendert, sodass das Tk-Rechteck hinter dem abgerundeten
+# CTkFrame verschwindet. Darf NIRGENDS sonst in der UI vorkommen.
+TRANSPARENT_KEY = "#010203"
+
+# Design-Tokens — eine zentrale Palette statt Hex-Streuung.
+COL_BG_SURFACE   = "#0e141d"   # Hauptflaeche
+COL_BG_RAISED    = "#161e29"   # Dropdown / Pill / Hover
+COL_BG_RAISED_HI = "#1d2734"   # Hover-State
+COL_BG_DIVIDER   = "#1a2230"   # zarte Trennung (selten benutzt)
+COL_FG_PRIMARY   = "#f1f4f9"   # primaerer Text
+COL_FG_SECONDARY = "#8a93a4"   # subtiler Text
+COL_FG_MUTED     = "#5a6478"   # noch dezenter
 
 # CTk-Widget-Referenzen
 ctk_refs = {
-    "shell": None,        # outer CTkFrame (border + accent)
+    "shell": None,        # outer CTkFrame (rounded, kein Border)
     "header": None,       # header CTkFrame
     "body": None,         # status-body CTkFrame
-    "name_lbl": None,     # "◆ AIbersetzer"
+    "name_lbl": None,     # "AIbersetzer"
     "subtitle": None,     # "Sprache → Text"
     "mode_btn": None,     # CTkOptionMenu
     "status_dot": None,   # CTkLabel mit ● dot
     "status_main": None,  # main status text
     "status_sub": None,   # sub status text
+    "accent_bar": None,   # 3px Akzent-Streifen links
 }
 
 ctk.set_appearance_mode("dark")
 
-# (Old legacy pill-button popup removed — CTkOptionMenu uebernimmt das nativ.)
+# Wird in build_overlay() auf Segoe UI Variable / Inter / Segoe UI gesetzt.
+FONT_FAMILY = {"display": "Segoe UI", "text": "Segoe UI"}
+
+def _detect_fonts() -> None:
+    """Bevorzugt Win11-native Segoe UI Variable, dann Inter, dann Segoe UI."""
+    try:
+        import tkinter.font as tkfont
+        avail = set(tkfont.families())
+        for f in ("Segoe UI Variable Display", "Inter Display", "Segoe UI Variable", "Inter", "Segoe UI"):
+            if f in avail:
+                FONT_FAMILY["display"] = f; break
+        for f in ("Segoe UI Variable Text", "Inter", "Segoe UI Variable", "Segoe UI"):
+            if f in avail:
+                FONT_FAMILY["text"] = f; break
+    except Exception as e:
+        log.warning(f"font detect failed: {e}")
 
 STATUS_COLORS = {
-    "boot":  ("#7a8290",  "#10151c"),  # text, frame border
+    "boot":  ("#7a8290",  "#10151c"),
     "idle":  ("#e8ecf3",  "#2a3548"),
     "rec":   ("#ffffff",  "#ff3854"),
     "tx":    ("#ffffff",  "#00e5ff"),
@@ -169,19 +201,19 @@ def _short_preview(text: str, n: int = 42) -> str:
     return text if len(text) <= n else text[:n-1] + "…"
 
 def overlay_redraw() -> None:
-    """Aktualisiert die CTk-Widgets je nach overlay_state.
-    Kein Canvas mehr — alles native CTk."""
+    """Aktualisiert die CTk-Widgets je nach overlay_state."""
     if not ctk_refs["shell"]:
         return
     s = overlay_state["s"]; msg = overlay_state["msg"]
-    accent = MODE_COLORS.get(polish_mode, "#7a8290")
+    accent = MODE_COLORS.get(polish_mode, COL_FG_SECONDARY)
 
-    # Shell-Border in Mode-Akzentfarbe
+    # Akzent-Streifen + App-Name in Mode-Akzentfarbe
     try:
-        ctk_refs["shell"].configure(border_color=accent)
+        if ctk_refs["accent_bar"]:
+            ctk_refs["accent_bar"].configure(fg_color=accent)
     except Exception: pass
     try:
-        ctk_refs["name_lbl"].configure(text_color=accent)
+        ctk_refs["name_lbl"].configure(text_color=COL_FG_PRIMARY)
     except Exception: pass
 
     # Status-Bereich
@@ -189,17 +221,17 @@ def overlay_redraw() -> None:
     if s == "boot":
         main_text = msg or "Wird geladen…"
         sub_text  = "Modell wird vorbereitet"
-        dot_color = "#7a8290"
+        dot_color = COL_FG_MUTED
     elif s == "idle":
         main_text = "Bereit"
         if not api_key_ref["k"] and polish_mode not in ("off", "coding"):
-            sub_text = "Kein API-Key – Polish inaktiv"
+            sub_text = "Kein API-Key — Polish inaktiv"
         else:
-            sub_text = f"Strg + Leertaste → Aufnahme"
-        dot_color = accent if polish_mode != "off" else "#2a2f3a"
+            sub_text = "Strg + Leertaste  →  Aufnahme"
+        dot_color = accent if polish_mode != "off" else COL_FG_MUTED
     elif s == "rec":
         main_text = "Aufnahme läuft"
-        sub_text  = "Strg + Leertaste → Stopp"
+        sub_text  = "Strg + Leertaste  →  Stopp"
         dot_color = "#ff3854"
     elif s == "tx":
         main_text = msg or "Wird transkribiert…"
@@ -221,24 +253,24 @@ def overlay_redraw() -> None:
     except Exception: pass
 
 def pulse_tick() -> None:
-    """Pulsiert die Shell-Border-Farbe waehrend Recording/Transcribing."""
+    """Pulsiert den Akzent-Streifen waehrend Recording/Transcribing — subtil."""
     r = root_ref["r"]
-    shell = ctk_refs["shell"]
-    if not r or not shell:
+    bar = ctk_refs["accent_bar"]
+    if not r or not bar:
         return
     s = overlay_state["s"]
     if s in ("rec", "tx"):
         pulse_phase["p"] = 1 - pulse_phase["p"]
         if s == "rec":
-            cols = ("#ff3854", "#ff90a8")
+            cols = ("#ff3854", "#ff8aa0")
         else:
             cols = ("#00e5ff", "#80f0ff")
         try:
-            shell.configure(border_color=cols[pulse_phase["p"]])
+            bar.configure(fg_color=cols[pulse_phase["p"]])
         except Exception:
             pass
     try:
-        r.after(450, pulse_tick)
+        r.after(420, pulse_tick)
     except Exception:
         pass
 
@@ -264,54 +296,81 @@ def build_overlay() -> ctk.CTk:
     root.attributes("-topmost", True)
     sw = root.winfo_screenwidth()
     root.geometry(f"{OV_W}x{OV_H}+{sw//2 - OV_W//2}+12")
-    # Native Acrylic-Blur (Windows 11) / Mica via pywinstyles wenn verfuegbar
+
+    # Moderne Typografie: Segoe UI Variable / Inter / Segoe UI auto-detect.
+    _detect_fonts()
+    FAM_D = FONT_FAMILY["display"]
+    FAM_T = FONT_FAMILY["text"]
+
+    # Color-Key fuer echte runde Ecken: Tk-Hintergrund auf TRANSPARENT_KEY,
+    # OS rendert diese Farbe als Alpha=0 → schwarze Ecken verschwinden.
+    try:
+        root.configure(bg=TRANSPARENT_KEY)
+        root.wm_attributes("-transparentcolor", TRANSPARENT_KEY)
+    except Exception as e:
+        log.warning(f"transparentcolor failed: {e}")
+
+    # Native Mica/Acrylic-Backdrop (Windows 11) via pywinstyles, optional.
     if pywinstyles:
         try:
             pywinstyles.apply_style(root, "dark")
-            pywinstyles.set_opacity(root, value=0.98)
         except Exception as e:
             log.warning(f"pywinstyles: {e}")
 
-    # Outer Shell — CTkFrame mit echtem corner_radius + Mode-Akzent-Border
+    # Outer Shell — abgerundeter CTkFrame, kein Border (modern: Tint statt Linie).
     shell = ctk.CTkFrame(
         root,
-        fg_color="#0d1219",
-        border_color="#00e5ff",
-        border_width=2,
-        corner_radius=20,
+        fg_color=COL_BG_SURFACE,
+        border_width=0,
+        corner_radius=28,
     )
-    shell.pack(fill="both", expand=True, padx=4, pady=4)
+    shell.pack(fill="both", expand=True, padx=2, pady=2)
     ctk_refs["shell"] = shell
     root_ref["r"] = root
 
+    # Schmaler Akzent-Streifen oben — pulsiert bei rec/tx, sonst Mode-Farbe.
+    accent_bar = ctk.CTkFrame(
+        shell, fg_color=MODE_COLORS.get(polish_mode, COL_FG_MUTED),
+        height=3, corner_radius=2,
+    )
+    accent_bar.pack(fill="x", padx=22, pady=(10, 0))
+    ctk_refs["accent_bar"] = accent_bar
+
     # ---------- Header ----------
     header = ctk.CTkFrame(shell, fg_color="transparent", height=58)
-    header.pack(fill="x", padx=20, pady=(14, 0))
+    header.pack(fill="x", padx=26, pady=(14, 0))
     header.pack_propagate(False)
     ctk_refs["header"] = header
 
     name_frame = ctk.CTkFrame(header, fg_color="transparent")
-    name_frame.pack(side="left")
-    name_lbl = ctk.CTkLabel(name_frame, text="◆  AIbersetzer",
-                            font=ctk.CTkFont("Segoe UI", 17, weight="bold"),
-                            text_color="#00e5ff")
-    name_lbl.pack(anchor="w")
-    sub_lbl = ctk.CTkLabel(name_frame, text="Sprache → Text",
-                           font=ctk.CTkFont("Segoe UI", 9),
-                           text_color="#5a6270")
-    sub_lbl.pack(anchor="w")
+    name_frame.pack(side="left", anchor="w")
+    name_lbl = ctk.CTkLabel(
+        name_frame, text="AIbersetzer",
+        font=ctk.CTkFont(FAM_D, 19, weight="bold"),
+        text_color=COL_FG_PRIMARY,
+    )
+    name_lbl.pack(anchor="w", pady=(0, 0))
+    sub_lbl = ctk.CTkLabel(
+        name_frame, text="Sprache → Text",
+        font=ctk.CTkFont(FAM_T, 10),
+        text_color=COL_FG_MUTED,
+    )
+    sub_lbl.pack(anchor="w", pady=(2, 0))
     ctk_refs["name_lbl"] = name_lbl
     ctk_refs["subtitle"] = sub_lbl
 
-    # ---------- Mode-Picker (native CTkOptionMenu) ----------
+    # ---------- Mode-Picker (Pill-Form, Akzent als linker Button) ----------
     def on_mode_select(choice: str):
         for m in MODE_ORDER:
             if MODE_LABELS[m] == choice:
                 set_mode(m)
-                # Akzentfarbe sofort uebernehmen
                 col = MODE_COLORS.get(m, "#00e5ff")
                 try:
                     ctk_refs["mode_btn"].configure(button_color=col, button_hover_color=col)
+                except Exception: pass
+                try:
+                    if ctk_refs["accent_bar"]:
+                        ctk_refs["accent_bar"].configure(fg_color=col)
                 except Exception: pass
                 overlay_set_then_idle("done", f"→  {MODE_LABELS[m]}", 700)
                 break
@@ -320,63 +379,65 @@ def build_overlay() -> ctk.CTk:
         header,
         values=[MODE_LABELS[m] for m in MODE_ORDER],
         command=on_mode_select,
-        width=230, height=34,
-        corner_radius=17,
-        font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
-        dropdown_font=ctk.CTkFont("Segoe UI", 11),
-        fg_color="#1a1f2a",
+        width=252, height=38,
+        corner_radius=19,
+        font=ctk.CTkFont(FAM_T, 12, weight="bold"),
+        dropdown_font=ctk.CTkFont(FAM_T, 11),
+        fg_color=COL_BG_RAISED,
         button_color=MODE_COLORS.get(polish_mode, "#00e5ff"),
         button_hover_color=MODE_COLORS.get(polish_mode, "#00e5ff"),
-        text_color="#e8ecf3",
-        dropdown_fg_color="#0d1219",
-        dropdown_hover_color="#1d2530",
-        dropdown_text_color="#e8ecf3",
+        text_color=COL_FG_PRIMARY,
+        dropdown_fg_color=COL_BG_SURFACE,
+        dropdown_hover_color=COL_BG_RAISED_HI,
+        dropdown_text_color=COL_FG_PRIMARY,
         anchor="w",
     )
     mode_btn.set(MODE_LABELS[polish_mode])
     mode_btn.pack(side="right")
     ctk_refs["mode_btn"] = mode_btn
 
-    # Trennlinie unter Header
-    sep = ctk.CTkFrame(shell, fg_color="#1f2a3a", height=1)
-    sep.pack(fill="x", padx=22, pady=(8, 0))
-
-    # ---------- Status-Body ----------
+    # ---------- Status-Body (Whitespace statt Trennlinie) ----------
     body = ctk.CTkFrame(shell, fg_color="transparent")
-    body.pack(fill="both", expand=True, padx=20, pady=(10, 14))
+    body.pack(fill="both", expand=True, padx=26, pady=(8, 18))
     ctk_refs["body"] = body
 
     status_row = ctk.CTkFrame(body, fg_color="transparent")
-    status_row.pack(anchor="w")
+    status_row.pack(anchor="w", pady=(8, 0))
 
-    dot_lbl = ctk.CTkLabel(status_row, text="●",
-                           font=ctk.CTkFont("Segoe UI", 22),
-                           text_color="#3a3a3a", width=24)
-    dot_lbl.pack(side="left", padx=(0, 12))
+    dot_lbl = ctk.CTkLabel(
+        status_row, text="●",
+        font=ctk.CTkFont(FAM_D, 24),
+        text_color=COL_FG_MUTED, width=22,
+    )
+    dot_lbl.pack(side="left", padx=(0, 14))
     ctk_refs["status_dot"] = dot_lbl
 
     text_frame = ctk.CTkFrame(status_row, fg_color="transparent")
     text_frame.pack(side="left")
 
-    main_lbl = ctk.CTkLabel(text_frame, text="Bereit",
-                            font=ctk.CTkFont("Segoe UI", 14, weight="bold"),
-                            text_color="#e8ecf3", anchor="w")
+    main_lbl = ctk.CTkLabel(
+        text_frame, text="Bereit",
+        font=ctk.CTkFont(FAM_D, 15, weight="bold"),
+        text_color=COL_FG_PRIMARY, anchor="w",
+    )
     main_lbl.pack(anchor="w")
-    sub_status = ctk.CTkLabel(text_frame, text="Strg + Leertaste → Aufnahme",
-                              font=ctk.CTkFont("Segoe UI", 10),
-                              text_color="#7c8390", anchor="w")
-    sub_status.pack(anchor="w")
+    sub_status = ctk.CTkLabel(
+        text_frame, text="Strg + Leertaste  →  Aufnahme",
+        font=ctk.CTkFont(FAM_T, 10),
+        text_color=COL_FG_SECONDARY, anchor="w",
+    )
+    sub_status.pack(anchor="w", pady=(2, 0))
     ctk_refs["status_main"] = main_lbl
     ctk_refs["status_sub"] = sub_status
 
-    # ---------- Drag-to-move (auf shell + header + name_lbl, nicht auf mode_btn) ----------
+    # ---------- Drag-to-move (shell + header-Bereiche, nicht Dropdown) ----------
     def on_press(e):
         root._dx = e.x_root - root.winfo_x()
         root._dy = e.y_root - root.winfo_y()
     def on_drag(e):
         root.geometry(f"+{e.x_root - root._dx}+{e.y_root - root._dy}")
     for w in (shell, header, name_frame, name_lbl, sub_lbl, body, status_row,
-              dot_lbl, text_frame, main_lbl, sub_status, sep):
+              dot_lbl, text_frame, main_lbl, sub_status, accent_bar):
         try:
             w.bind("<Button-1>",  on_press)
             w.bind("<B1-Motion>", on_drag)

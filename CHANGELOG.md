@@ -2,6 +2,35 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-06-06 – UI-Redesign (modern, abgerundet, transparent)
+
+**Was war kaputt:**
+Das Overlay sah oldschool aus: schwarze Ecken um den runden Rahmen,
+klassisches Segoe UI 17 bold, klobiger 2px-Border, Trennlinie unterm Header.
+Wirkte wie ein Tool aus 2015.
+
+**Was jetzt anders ist:**
+
+- **Schwarze Ecken weg.** Das Fenster nutzt jetzt den Windows-Color-Key-Trick
+  (`-transparentcolor` auf einen exotischen Farbton): alle Pixel außerhalb der
+  abgerundeten Form sind echt transparent — man sieht den Desktop dahinter
+  durch die runden Ecken.
+- **Größerer Radius**: `corner_radius=28` (vorher 20) — deutlich „weicher".
+- **Border raus, Akzent-Streifen rein.** Statt klobigem 2px-Rahmen jetzt ein
+  schlanker 3px-Akzentstreifen oben in der jeweiligen Modus-Farbe. Pulsiert
+  bei Aufnahme/Transkribieren.
+- **Moderne Typografie**: auto-detect für Segoe UI Variable Display
+  (Windows-11-native, deutlich modernerer Look), Fallback auf Inter / Segoe UI.
+  Größen + Weights angepasst (19/600 für App-Name, 15/600 für Status).
+- **Pill-Dropdown**: höher (38px), runder (radius 19), tighter Font.
+  Akzentfarbe wandert mit dem gewählten Modus.
+- **Trennlinie unter Header weg** — moderne Apps gruppieren mit Whitespace
+  statt Linien.
+- **Generöseres Padding** (26px statt 20), Fenster auf 600×172 (vorher 560×138)
+  für mehr Atemraum.
+- **Zentrale Design-Tokens** (`COL_BG_SURFACE`, `COL_FG_PRIMARY` etc.) — eine
+  Palette statt Hex-Streuung im Code.
+
 ## 2026-06-06 – Weniger Weigerungen, bessere Personas
 
 **Was war kaputt:**
