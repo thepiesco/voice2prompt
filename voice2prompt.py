@@ -362,7 +362,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   .shell.rec .logo i:nth-child(2){ animation-delay:.15s; }
   .shell.rec .logo i:nth-child(3){ animation-delay:.3s; }
   @keyframes eq { 0%,100%{transform:scaleY(0.5);} 50%{transform:scaleY(1.25);} }
-  .brand .name { font-size:18px; font-weight:700; letter-spacing:-0.02em; line-height:1; }
+  .brand .name { font-size:20px; font-weight:700; letter-spacing:-0.02em; line-height:1; }
   .brand .name .ai {
     color:var(--accent);
     text-shadow:0 0 16px color-mix(in srgb, var(--accent) 45%, transparent);
@@ -378,7 +378,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     display:flex; align-items:center; gap:9px; min-width:212px; max-width:300px;
     padding:9px 11px 9px 12px; border-radius:11px; cursor:pointer;
     background:var(--raised); border:1px solid var(--border-subtle);
-    color:var(--fg-primary); font-size:12px; font-weight:600; letter-spacing:-0.005em;
+    color:var(--fg-primary); font-size:13.5px; font-weight:600; letter-spacing:-0.005em;
     transition:background .16s, border-color .16s, transform .08s;
   }
   .pill:hover { background:var(--raised-hi); border-color:var(--border-strong); }
@@ -405,7 +405,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   .shell.menuopen .body { visibility:hidden; opacity:0; }
   .item {
     display:flex; align-items:center; gap:10px; padding:9px 11px; border-radius:9px;
-    cursor:pointer; font-size:12px; font-weight:500; color:var(--fg-primary);
+    cursor:pointer; font-size:13.5px; font-weight:500; color:var(--fg-primary);
     letter-spacing:-0.005em; position:relative; transition:background .12s;
   }
   .item:hover { background:rgba(255,255,255,0.06); }
@@ -444,12 +444,12 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   .stext { min-width:0; }
   .smain {
-    font-size:15px; font-weight:600; letter-spacing:-0.015em; line-height:1.2;
-    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:330px;
+    font-size:18px; font-weight:600; letter-spacing:-0.015em; line-height:1.2;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:360px;
   }
-  .ssub { font-size:11px; font-weight:400; color:var(--fg-secondary); margin-top:4px; letter-spacing:.005em; }
+  .ssub { font-size:12.5px; font-weight:400; color:var(--fg-secondary); margin-top:4px; letter-spacing:.005em; }
   .ssub kbd {
-    font:600 10px 'Inter',sans-serif; background:rgba(255,255,255,0.07);
+    font:600 11.5px 'Inter',sans-serif; background:rgba(255,255,255,0.07);
     border:1px solid rgba(255,255,255,0.11); padding:2px 6px; border-radius:5px;
     color:var(--fg-primary); margin:0 1px;
     box-shadow:0 1px 0 rgba(255,255,255,0.05) inset, 0 1px 2px rgba(0,0,0,0.3);
@@ -734,9 +734,35 @@ class JsAPI:
             except Exception as e:
                 log.debug(f"resize failed: {e}")
 
+# Wunsch-Position auf dem TV (DISPLAY2). Wird nur genutzt, wenn der TV
+# angeschlossen ist — sonst landet das Overlay sichtbar auf dem aktiven Bildschirm.
+PREF_X = 3466   # TV: 2434 + (2560-495)//2
+PREF_Y = 2190   # TV: 2160 + 30px Abstand oben
+
+def resolve_position():
+    """TV-Position wenn sie im aktuellen (virtuellen) Bildschirm liegt, sonst
+    sichtbar oben-mittig auf dem Primaer-Display. Verhindert ein unsichtbares
+    Overlay, wenn der TV abgesteckt ist."""
+    try:
+        GSM = ctypes.windll.user32.GetSystemMetrics
+        vx, vy, vw, vh = GSM(76), GSM(77), GSM(78), GSM(79)   # X/Y/CX/CY VIRTUALSCREEN
+        x, y = PREF_X, PREF_Y
+        if not (vx <= x and vy <= y and x + OV_W <= vx + vw and y + OV_H <= vy + vh):
+            cx = GSM(0)   # Breite Primaer-Display
+            x = max(vx, (cx - OV_W) // 2)
+            y = vy + 60
+            log.info(f"Wunsch-Pos off-screen (virt {vx},{vy} {vw}x{vh}) -> Fallback {x},{y}")
+        else:
+            log.info(f"Wunsch-Pos {x},{y} im Bildschirm -> uebernommen")
+        return x, y
+    except Exception as e:
+        log.warning(f"resolve_position: {e}")
+        return 60, 60
+
 def build_overlay():
     """Erstellt das pywebview-Window. Muss VOR webview.start() aufgerufen werden."""
     api = JsAPI()
+    px, py = resolve_position()
     win = webview.create_window(
         APP_NAME,
         html=_build_html(),
@@ -746,8 +772,8 @@ def build_overlay():
         on_top=True,
         width=OV_W,
         height=OV_H,
-        x=3466,   # DISPLAY2 (TV): 2434 + (2560-495)//2 (neu zentriert fuer 495px)
-        y=2190,   # DISPLAY2 (TV): 2160 + 30px Abstand oben
+        x=px,
+        y=py,
         resizable=False,
     )
     window_ref["w"] = win

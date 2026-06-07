@@ -2,6 +2,18 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-06-07 – Text größer + Overlay nie mehr unsichtbar
+
+- **Text besser lesbar.** Nach dem Verkleinern war die Schrift einen Ticken zu
+  klein. Status, App-Name, Modus-Pille und Menü sind jetzt ~18% größer – das
+  Fenster bleibt aber kompakt (nur die Schrift wächst, nicht der Rahmen).
+- **Overlay landet immer sichtbar.** Die feste TV-Position führte dazu, dass das
+  Overlay komplett unsichtbar war, sobald der TV abgesteckt ist (es klebte im
+  Nichts rechts außerhalb des Bildschirms). Jetzt wird beim Start geprüft: ist
+  die TV-Position gerade im Bildschirm? Ja → dort. Nein (TV aus) → automatisch
+  sichtbar oben-mittig auf dem aktiven Bildschirm. Kommt der TV zurück, geht's
+  wieder dorthin.
+
 ## 2026-06-07 – Fenster 25% kleiner
 
 Auf Wunsch: das Overlay war einen Ticken zu groß. Jetzt ist alles um 25%
