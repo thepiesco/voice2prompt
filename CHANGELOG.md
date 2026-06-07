@@ -2,6 +2,14 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-06-07 – Fenster 25% kleiner
+
+Auf Wunsch: das Overlay war einen Ticken zu groß. Jetzt ist alles um 25%
+verkleinert – und zwar proportional (Schrift, Abstände, Waveform, Menü
+skalieren per CSS-Maßstab `--sc` gemeinsam mit), also bleibt das Layout exakt
+gleich, nur kompakter. Fenster 660→495 px breit, Position auf dem TV neu
+zentriert. Runde Ecken/Schweben unverändert (auf echtem Bildschirm geprüft).
+
 ## 2026-06-07 – Nachbesserung: weißer Kasten weg + Opus-API-Schutz
 
 **Was war kaputt:**

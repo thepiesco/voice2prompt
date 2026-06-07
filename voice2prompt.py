@@ -206,10 +206,11 @@ def acquire_single_instance() -> bool:
 # selbst rund: die Karte FUELLT das Fenster opak, SetWindowRgn clippt es auf ein
 # abgerundetes Rechteck. So schwebt es sauber, runde Ecken stimmen, kein weisser
 # Kasten — unabhaengig von der WebView-Transparenz.
-OV_W       = 660
-OV_H       = 138    # kompakt (Menue zu) — Karte fuellt das Fenster
-OV_H_OPEN  = 412    # aufgeklappt (Menue offen) — Fenster waechst per resize()
-CORNER_R   = 22     # Eckenradius (CSS border-radius UND SetWindowRgn identisch)
+# Fenster auf 75% verkleinert (UI skaliert per CSS --sc:0.75 proportional mit).
+OV_W       = 495    # 660 * 0.75
+OV_H       = 104    # kompakt (Menue zu); 138 * 0.75
+OV_H_OPEN  = 309    # aufgeklappt (Menue offen); 412 * 0.75
+CORNER_R   = 17     # Eckenradius visuell (22 CSS * 0.75 ≈ 16.5) -> SetWindowRgn
 
 window_ref = {"w": None}
 hwnd_ref   = {"h": 0}
@@ -282,6 +283,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 <title>AIbersetzer</title>
 <style>
   :root {
+    --sc: 0.75;   /* globaler UI-Maßstab — alles skaliert proportional mit */
     --fg-primary: #f4f6fa;
     --fg-secondary: #9aa3b2;
     --fg-muted: #5c6677;
@@ -308,9 +310,13 @@ HTML_TEMPLATE = r"""<!doctype html>
      SetWindowRgn rund geclippt -> die opake Karte IST die schwebende Form. */
   body { display:block; }
 
+  /* Die Karte ist in Design-Groesse (1/scale) angelegt und wird per transform
+     auf die kleinere Fenstergroesse herunterskaliert -> Schrift/Padding/Waveform
+     schrumpfen alle proportional mit, kein Neulayout noetig. */
   .shell {
-    position:relative;
-    width:100vw; height:100vh;
+    position:absolute; top:0; left:0;
+    width:calc(100vw / var(--sc)); height:calc(100vh / var(--sc));
+    transform:scale(var(--sc)); transform-origin:top left;
     border-radius:22px;
     background:linear-gradient(168deg, #161a24 0%, #0d1018 100%);
     border:1px solid rgba(255,255,255,0.10);
@@ -740,7 +746,7 @@ def build_overlay():
         on_top=True,
         width=OV_W,
         height=OV_H,
-        x=3384,   # DISPLAY2 (TV): 2434 + (2560-660)//2
+        x=3466,   # DISPLAY2 (TV): 2434 + (2560-495)//2 (neu zentriert fuer 495px)
         y=2190,   # DISPLAY2 (TV): 2160 + 30px Abstand oben
         resizable=False,
     )
