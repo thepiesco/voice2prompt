@@ -85,6 +85,10 @@ console.anthropic.com/settings/keys), dann start.cmd starten.
 
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (small, int8, CPU)
 - [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-python) (Claude Haiku 4.5)
-- Tkinter Overlay + ttk.Combobox für Modus-Wahl
-- Windows `RegisterHotKey` für stabilen globalen Aufnahme-Hotkey
+- Overlay rendert in Edge WebView2 via [pywebview](https://pywebview.flowrl.com/)
+  — Command-Bar-Design mit Live-Waveform (Canvas), runde Ecken über
+  transparentes Fenster + CSS (kein GDI-Region-Gefrickel mehr)
+- Windows `RegisterHotKey` für stabilen globalen Aufnahme-Hotkey, abgesichert
+  durch einen Single-Instance-Lock (Named Mutex)
+- Gewählter Modus wird in `settings.json` gemerkt (überlebt Neustart)
 - pystray Tray-Icon

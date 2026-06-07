@@ -5,3 +5,5 @@ __pycache__/
 _check.py
 _smoke.py
 _test_polish.py
+_verify/
+settings.json

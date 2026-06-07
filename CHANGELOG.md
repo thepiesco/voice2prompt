@@ -2,6 +2,80 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-06-07 – Grundüberholung: hört auf zu buggen + neues Profi-Design
+
+Das große Aufräumen. Zwei Ziele: nicht mehr ständig spinnen, und endlich
+richtig gut aussehen. Beides erledigt.
+
+**Was ständig kaputt war – und jetzt gefixt ist:**
+
+- **Das Tool hat sich beim zweiten Start selbst lahmgelegt.** Wenn es schon
+  lief (z.B. per Autostart) und man es nochmal startete, stritten sich beide um
+  den Strg+Leer-Hotkey – Ergebnis: ein toter Zombie-Prozess und „Hotkey
+  blockiert"-Fehler. Jetzt gibt es eine Türsteher-Sperre (Single-Instance): ein
+  zweiter Start sagt freundlich „läuft schon" und beendet sich.
+- **Der Aufnahme-Knopf hat sich verschluckt.** Schnell zweimal Strg+Leer und das
+  Tool hing fest oder spuckte ein leeres Ergebnis aus (im Log: „REC start → stop
+  in unter 1 Sekunde → 0 Zeichen"). Ursache: jeder Tastendruck startete einen
+  eigenen Thread, die sich gegenseitig den Status zerschossen. Jetzt läuft alles
+  sauber serialisiert (ein Schloss), Doppel-Tipper werden abgefangen, und ein
+  versehentlich zu kurzer Stopp nimmt einfach weiter auf, statt wegzuwerfen.
+- **Das erste Wort wurde manchmal abgeschnitten.** Es gibt jetzt einen kleinen
+  Vorlauf-Puffer (~0,3 s vor dem Tastendruck), damit der Anfang nicht verloren
+  geht.
+- **„Strg+V" kam manchmal nicht an** (weil man ja noch Strg gedrückt hielt).
+  Jetzt werden die Tasten vorher sauber losgelassen – das Einfügen klappt
+  zuverlässig. Und dein vorheriger Zwischenablage-Inhalt wird danach
+  wiederhergestellt.
+- **Stilisierter Text wurde manchmal grundlos weggeworfen.** Der „keine
+  KI-Ausrede"-Wächter hat zu scharf zugeschlagen und z.B. einen Justus-Spruch
+  mit „literally" oder ein „Sorry, Meeting verschoben" fälschlich als Weigerung
+  erkannt – und dann den rohen Text statt der schönen Übersetzung eingefügt.
+  Jetzt prüft er nur noch die allererste Zeile auf echte Weigerungen; mitten im
+  Text darf alles stehen.
+- **Mikrofon-Ausfall killt nicht mehr alles.** Wird das Mikro getrennt/gewechselt,
+  startet der Audio-Stream automatisch neu, statt still zu sterben.
+- **Fenster-Geflacker beim Auf-/Zuklappen weg.** Die alte Trick-Technik für
+  runde Ecken (Windows-Regionen) flackerte bei hoher Bildschirm-Skalierung und
+  hatte ein Speicherleck. Komplett rausgeworfen – runde Ecken kommen jetzt rein
+  über transparentes Fenster + CSS. Stabil, kein Geflacker.
+
+**Was jetzt neu/besser ist:**
+
+- **Der gewählte Modus bleibt erhalten.** Nach einem Neustart ist wieder der
+  Modus aktiv, den du zuletzt benutzt hast (gespeichert in `settings.json`) –
+  nicht mehr stur „Coding".
+- **Live-Waveform während der Aufnahme.** Im Overlay tanzt jetzt eine echte
+  Audiokurve, die auf deine Stimme reagiert (mit Peak-Anzeige) – man sieht
+  sofort, dass das Mikro hört.
+- **Komplett neues Design** im Stil moderner Profi-Tools (Raycast/Linear):
+  ruhige, edle dunkle Glas-Karte, feine Akzent-Lichtkante oben in der Modus-
+  Farbe, klares Logo, sauberer Modus-Picker mit Farbpunkten, sechs klar
+  unterscheidbare Zustände (Laden/Bereit/Aufnahme/Transkribiert/Fertig/Fehler).
+- **Schneller erster Start des Fensters.** Die Schrift kommt nicht mehr aus dem
+  Internet (Google Fonts), sondern aus dem System – kein Lade-Hänger mehr.
+- **Log wächst nicht mehr unbegrenzt** (rotiert bei 1 MB).
+
+## 2026-06-06 – Dropdown-Fix, weniger Rand, mehr Farbe
+
+**Was war kaputt:**
+Das Dropdown-Menü öffnete sich unterhalb des 200px-Fensters und war deshalb
+abgeschnitten – alle Modi ab dem dritten waren unsichtbar. Dazu: 16px weißer
+Rand ringsrum, Hintergrund zu dunkel/grau.
+
+**Was jetzt anders ist:**
+
+- **Dropdown klappt vollständig auf.** Beim Öffnen vergrößert sich das Fenster
+  dynamisch (170 → 520px), beim Schließen wieder zurück. Alle 13 Modi sichtbar.
+- **Rand kleiner.** Margin von 16px auf 7px reduziert — kaum noch sichtbarer
+  weißer Rand außen.
+- **Farbiger Hintergrund.** Shell-Hintergrund ist jetzt ein dunkelblaues
+  Gradient statt flach-grau. Der aktive Modus-Farbakzent strahlt als Ambient-
+  Glow nach außen UND als subtiler Gradient oben im Panel rein.
+- **Rand passt sich der Modus-Farbe an.** Der Border-Farbton wechselt mit dem
+  gewählten Modus (color-mix mit Akzentfarbe).
+- **Akzent-Stripe dicker und heller.** 3→4px, opacity 0.7→0.9, doppelter Glow.
+
 ## 2026-06-06 – UI komplett neu: WebView statt Tkinter (echtes 2026er Design)
 
 **Was war kaputt:**

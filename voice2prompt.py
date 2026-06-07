@@ -5,23 +5,28 @@ EIN Hotkey: STRG + LEERTASTE = Aufnahme an/aus.
 Modus-Wahl: Drop-Down im Overlay oben am Bildschirm.
 
 Modi: Aus / Coding / Casual / Bayrisch / Pfaelzisch / Freundin-Light /
-      Freundin-Hardcore / Yoda / Goethe / Marketing-Bullshit / Pirat.
+      Freundin-Hardcore / Yoda / Goethe / Marketing-Bullshit / Pirat /
+      Besoffen / Justus.
 
-Log: voice2prompt.log
+UI: Edge WebView2 (pywebview), Command-Bar-Look mit Live-Waveform (Canvas).
+Log: voice2prompt.log (rotierend).
 """
 APP_NAME = "AIbersetzer"
 import os
 import re
+import sys
 import time
+import json
 import queue
 import threading
 import tempfile
 import wave
 import logging
+from logging.handlers import RotatingFileHandler
 import ctypes
 from ctypes import wintypes
+from collections import deque
 
-import json
 import numpy as np
 import sounddevice as sd
 import keyboard          # nur fuer keyboard.send("ctrl+v") — Paste-Senden
@@ -36,25 +41,55 @@ except ImportError:
     anthropic = None
 
 # ---------- Konfig ----------
-MODEL_SIZE  = os.environ.get("V2P_MODEL", "small")
-LANGUAGE    = os.environ.get("V2P_LANG", "de")
-SAMPLE_RATE = 16000
-CHANNELS    = 1
-HERE        = os.path.dirname(os.path.abspath(__file__))
-LOG_PATH    = os.path.join(HERE, "voice2prompt.log")
-KEY_PATH    = os.path.join(HERE, "api.key")
+MODEL_SIZE   = os.environ.get("V2P_MODEL", "small")
+COMPUTE_TYPE = os.environ.get("V2P_COMPUTE", "int8")
+LANGUAGE     = os.environ.get("V2P_LANG", "de")
+SAMPLE_RATE  = 16000
+CHANNELS     = 1
+BLOCKSIZE    = 1600          # 100 ms @ 16 kHz — prompte, gleichmaessige Callbacks
+MIN_REC_SEC  = 0.35          # kuerzere "Aufnahmen" gelten als versehentlicher Doppel-Tap
+PREROLL_SEC  = 0.3           # so viel Audio VOR dem Start-Tap mitnehmen (kein abgeschnittenes erstes Wort)
+HERE         = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH     = os.path.join(HERE, "voice2prompt.log")
+KEY_PATH     = os.path.join(HERE, "api.key")
+SETTINGS_PATH = os.path.join(HERE, "settings.json")
 POLISH_MODEL = os.environ.get("V2P_POLISH_MODEL", "claude-haiku-4-5")
 
-logging.basicConfig(
-    filename=LOG_PATH, filemode="a", level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+# Rotierendes Log (max 1 MB, 2 Backups) — verhindert unbegrenztes Wachstum.
+_handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 log = logging.getLogger("v2p")
 
+# ---------- Settings (Modus ueberlebt Neustart) ----------
+def load_settings() -> dict:
+    try:
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"settings read failed: {e}")
+    return {}
+
+def save_settings(**changes) -> None:
+    data = load_settings()
+    data.update(changes)
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"settings write failed: {e}")
+
+_settings = load_settings()
+
+# ---------- Globaler State ----------
 audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
 recording = False
+transcribing = False           # Single-Flight: laeuft gerade eine Transkription?
+toggle_lock = threading.Lock()  # macht den Aufnahme-Toggle atomar (Kern-Race-Fix)
+rec_start = [0.0]              # monotone Startzeit der laufenden Aufnahme
 stop_signal = False
-polish_mode = "coding"  # einer aus MODE_ORDER
+_revert_token = [0]            # generation counter gegen "stale idle revert clobbert neuen State"
 
 # Modi in Drop-Down-Reihenfolge.
 MODE_ORDER = [
@@ -100,7 +135,7 @@ MODE_TEMPERATURE = {
     "yoda": 0.6, "goethe": 0.7, "marketing": 0.7, "pirat": 0.7,
     "besoffen": 1.0, "justus": 0.8,
 }
-# Akzent-Farbe pro Modus — fuer Overlay-Border + Combobox-Indikator
+# Akzent-Farbe pro Modus — fuer Overlay-Akzent + Waveform + Dropdown-Dots
 MODE_COLORS = {
     "off":               "#777a82",
     "coding":            "#00e5ff",
@@ -116,40 +151,78 @@ MODE_COLORS = {
     "besoffen":          "#c46d8c",
     "justus":            "#d4af37",
 }
+
+# Start-Modus aus Settings (Default coding); muss in MODE_ORDER sein.
+polish_mode = _settings.get("mode", "coding")
+if polish_mode not in MODE_LABELS:
+    polish_mode = "coding"
+
 model_ref = {"m": None}
 tray_ref  = {"t": None}
-root_ref  = {"r": None}
-canvas_ref = {"c": None}
 overlay_state = {"s": "boot", "msg": "lade Modell..."}
 
+# Pre-Roll-Ringpuffer: haelt immer die letzten ~PREROLL_SEC Sekunden Audio vor,
+# damit der erste Laut nach dem Tastendruck nicht verschluckt wird.
+_preroll_blocks = max(1, int(PREROLL_SEC * SAMPLE_RATE / BLOCKSIZE))
+prebuffer: "deque[np.ndarray]" = deque(maxlen=_preroll_blocks)
+prebuffer_lock = threading.Lock()   # schuetzt Snapshot vs. append aus dem Audio-Thread
+
 # ---------- Win32 RegisterHotKey ----------
-user32          = ctypes.windll.user32
+user32          = ctypes.WinDLL("user32", use_last_error=True)
+kernel32        = ctypes.WinDLL("kernel32", use_last_error=True)
 MOD_CONTROL     = 0x0002
 MOD_NOREPEAT    = 0x4000
 VK_SPACE        = 0x20
 WM_HOTKEY       = 0x0312
+WM_QUIT         = 0x0012
 HOTKEY_ID_REC   = 1   # Strg+Leertaste = Aufnahme (einziger Hotkey)
 
-# ---------- Overlay (pywebview, modernes HTML/CSS-UI mit Glassmorphism) ----------
-# UI rendert in Edge WebView2 (Windows-native). Inter Variable Font via Google
-# Fonts CDN, falls offline → Fallback Segoe UI Variable. Python<->JS Bridge via
-# pywebview.api.
-OV_W, OV_H = 660, 200
+# ---------- Single-Instance-Lock ----------
+# Verhindert die wiederkehrenden "RegisterHotKey FAILED"-Crashes: ein zweiter
+# Start (Autostart + manuell) wuerde sonst denselben Hotkey beanspruchen und als
+# Zombie haengenbleiben. Named Mutex -> zweite Instanz beendet sich sofort.
+_mutex_handle = None
+def acquire_single_instance() -> bool:
+    global _mutex_handle
+    ERROR_ALREADY_EXISTS = 183
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    # Slot vorher auf 0 setzen -> deterministisch: CreateMutexW setzt 183 NUR wenn
+    # der Mutex bereits existierte, sonst bleibt 0 (CreateMutexW resettet bei
+    # Neuanlage nicht zwingend selbst).
+    ctypes.set_last_error(0)
+    _mutex_handle = kernel32.CreateMutexW(None, False, "Global\\AIbersetzer_SingleInstance")
+    # WICHTIG: kernel32 ist mit use_last_error=True geladen -> der echte OS-Fehler
+    # liegt in ctypes' Thread-Slot, NICHT in kernel32.GetLastError(). Deshalb
+    # ctypes.get_last_error() (sonst greift der Single-Instance-Schutz gar nicht).
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        return False
+    return True
+
+# ---------- Overlay (pywebview, Command-Bar-UI mit Live-Waveform) ----------
+# UI rendert in Edge WebView2 (Windows-native). KEIN Google-Fonts-CDN (System-
+# Fontstack inline -> kein First-Paint-Blocker). KEIN SetWindowRgn mehr noetig:
+# transparent=True + CSS border-radius liefern saubere runde Ecken ganz ohne
+# GDI-Regionen (das beseitigt Region-Recut-Flacker, GDI-Leak, DPI-Mismatch).
+OV_W       = 660
+OV_H       = 172    # kompakt (Menue zu)
+OV_H_OPEN  = 432    # aufgeklappt (Menue offen) — Fenster waechst sauber per resize()
 
 window_ref = {"w": None}
+expanded_ref = {"v": False}
+resize_lock = threading.Lock()
 
-def _short_preview(text: str, n: int = 42) -> str:
-    return text if len(text) <= n else text[:n-1] + "…"
+def _short_preview(text: str, n: int = 40) -> str:
+    return text if len(text) <= n else text[:n - 1] + "…"
 
 def _js_eval(code: str) -> None:
-    """Sicher JS im WebView ausfuehren — kein Crash bei kein-Window-da."""
+    """Sicher JS im WebView ausfuehren — kein Crash wenn kein Window da."""
     w = window_ref["w"]
     if not w:
         return
     try:
         w.evaluate_js(code)
     except Exception as e:
-        log.warning(f"js_eval failed: {e}")
+        log.debug(f"js_eval failed: {e}")
 
 def overlay_redraw() -> None:
     """Pusht den aktuellen overlay_state in die UI."""
@@ -163,343 +236,441 @@ def overlay_redraw() -> None:
 def overlay_set(state: str, msg: str = "") -> None:
     overlay_state["s"] = state
     overlay_state["msg"] = msg
+    _revert_token[0] += 1   # jeder echte State-Wechsel entwertet wartende Reverts
     overlay_redraw()
 
 def overlay_set_then_idle(state: str, msg: str, after_ms: int) -> None:
     overlay_set(state, msg)
+    token = _revert_token[0]
     def revert():
         time.sleep(max(0.0, after_ms / 1000.0))
-        overlay_set("idle")
+        if _revert_token[0] == token:   # nur zuruecksetzen, wenn nichts Neueres kam
+            overlay_set("idle")
     threading.Thread(target=revert, daemon=True).start()
 
-# HTML/CSS-UI — rendert in Edge WebView2. Glassmorphism, Inter Variable Font,
-# custom Dropdown mit Mode-Dots, smooth CSS-Animationen.
+def push_level(x: float) -> None:
+    """Mikrofon-Pegel (0..1) an die Waveform schicken. Aus dem Audio-Thread."""
+    _js_eval(f"window.v2p && window.v2p.setLevel({x:.3f})")
+
+# HTML/CSS/JS-UI — rendert in Edge WebView2.
 HTML_TEMPLATE = r"""<!doctype html>
 <html lang="de">
 <head>
 <meta charset="utf-8">
 <title>AIbersetzer</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg-surface: rgba(13, 17, 25, 0.82);
-    --bg-raised: rgba(255, 255, 255, 0.05);
-    --bg-raised-hi: rgba(255, 255, 255, 0.10);
-    --bg-menu: rgba(18, 23, 32, 0.94);
-    --fg-primary: #f3f5f9;
-    --fg-secondary: #98a0af;
-    --fg-muted: #5d6678;
-    --border-subtle: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(255, 255, 255, 0.12);
+    --fg-primary: #f4f6fa;
+    --fg-secondary: #9aa3b2;
+    --fg-muted: #5c6677;
+    --border-subtle: rgba(255,255,255,0.08);
+    --border-strong: rgba(255,255,255,0.14);
+    --raised: rgba(255,255,255,0.05);
+    --raised-hi: rgba(255,255,255,0.09);
     --accent: __INITIAL_COLOR__;
+    --rec: #ff3b54;
+    --tx: #38d9ff;
+    --ok: #5ef08a;
+    --warn: #ff9d42;
   }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  * { margin:0; padding:0; box-sizing:border-box; }
   html, body {
-    width: 100vw; height: 100vh;
-    background: transparent;
-    font-family: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
-    font-feature-settings: 'cv02', 'cv03', 'cv11', 'ss01';
-    -webkit-font-smoothing: antialiased;
-    color: var(--fg-primary);
-    overflow: hidden;
-    user-select: none;
+    width:100vw; height:100vh; background:transparent; overflow:hidden;
+    user-select:none; cursor:default;
+    font-family:'Inter','Segoe UI Variable Display','Segoe UI',system-ui,sans-serif;
+    font-feature-settings:'cv02','cv03','cv11','ss01';
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    color:var(--fg-primary);
   }
+  /* Fenster ist bei offenem Menue hoch; die Karte sitzt oben, der Rest ist
+     transparent. Deshalb Body als Top-Flex statt zentriert. */
+  body { display:flex; align-items:flex-start; justify-content:center; }
+
   .shell {
-    position: relative;
-    margin: 16px;
-    height: calc(100vh - 32px);
-    border-radius: 24px;
-    background: var(--bg-surface);
-    backdrop-filter: blur(40px) saturate(180%);
-    -webkit-backdrop-filter: blur(40px) saturate(180%);
-    border: 1px solid var(--border-subtle);
+    position:relative;
+    width:calc(100vw - 14px);
+    margin:7px;
+    border-radius:22px;
+    background:
+      linear-gradient(168deg, rgba(20,24,34,0.92) 0%, rgba(12,15,23,0.94) 100%);
+    backdrop-filter:blur(22px);
+    -webkit-backdrop-filter:blur(22px);
+    border:1px solid var(--border-subtle);
     box-shadow:
-      0 32px 64px -16px rgba(0, 0, 0, 0.7),
-      0 0 0 1px rgba(255, 255, 255, 0.04) inset,
-      0 1px 0 0 rgba(255, 255, 255, 0.06) inset;
-    overflow: visible;
-    -webkit-app-region: drag;
+      0 22px 52px -12px rgba(0,0,0,0.72),
+      0 1px 0 0 rgba(255,255,255,0.06) inset;
+    overflow:visible;
+    -webkit-app-region:drag;
   }
-  .accent-stripe {
-    position: absolute;
-    top: 20px; bottom: 20px;
-    left: 0;
-    width: 3px;
-    background: var(--accent);
-    border-radius: 0 2px 2px 0;
-    box-shadow: 0 0 18px var(--accent);
-    opacity: 0.7;
-    transition: background 0.4s, box-shadow 0.4s, opacity 0.3s;
+  /* 2px Akzent-Lichtkante ganz oben — der EINZIGE flaechige Akzent */
+  .shell::before {
+    content:''; position:absolute; left:18px; right:18px; top:0; height:2px;
+    border-radius:2px;
+    background:linear-gradient(90deg,
+      transparent, color-mix(in srgb, var(--accent) 90%, transparent) 18%,
+      color-mix(in srgb, var(--accent) 90%, transparent) 82%, transparent);
+    box-shadow:0 0 14px -1px color-mix(in srgb, var(--accent) 70%, transparent);
+    opacity:0.9; transition:background .35s, box-shadow .35s;
+    pointer-events:none; z-index:3;
   }
-  .shell.rec .accent-stripe { background: #ff3854; box-shadow: 0 0 28px #ff3854; animation: stripe-pulse 1.4s infinite ease-in-out; }
-  .shell.tx  .accent-stripe { background: #00e5ff; box-shadow: 0 0 28px #00e5ff; animation: stripe-pulse 1.0s infinite ease-in-out; }
-  @keyframes stripe-pulse {
-    0%, 100% { opacity: 0.7; }
-    50% { opacity: 0.25; }
-  }
+
   .header {
-    padding: 22px 26px 0 30px;
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
+    display:flex; align-items:center; justify-content:space-between; gap:14px;
+    padding:18px 20px 8px 22px; position:relative; z-index:2;
   }
-  .brand h1 {
-    font-size: 19px; font-weight: 700;
-    letter-spacing: -0.025em;
-    color: var(--fg-primary);
-    line-height: 1.05;
-    display: flex; align-items: baseline; gap: 1px;
+  .brand { display:flex; align-items:center; gap:11px; }
+  .logo {
+    width:34px; height:34px; border-radius:10px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; gap:2px;
+    background:color-mix(in srgb, var(--accent) 14%, rgba(255,255,255,0.03));
+    border:1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    box-shadow:0 0 16px -4px color-mix(in srgb, var(--accent) 60%, transparent);
+    transition:background .35s, border-color .35s, box-shadow .35s;
   }
-  .brand h1 .ai {
-    color: var(--accent);
-    font-weight: 700;
-    transition: color 0.3s, text-shadow 0.3s;
-    text-shadow: 0 0 18px color-mix(in srgb, var(--accent) 35%, transparent);
+  .logo i {
+    display:block; width:3px; border-radius:2px; background:var(--accent);
+    transition:background .35s, height .18s ease;
   }
-  .brand p {
-    font-size: 11px; font-weight: 500;
-    color: var(--fg-muted);
-    margin-top: 4px;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
+  .logo i:nth-child(1){ height:9px; }
+  .logo i:nth-child(2){ height:16px; }
+  .logo i:nth-child(3){ height:11px; }
+  .shell.rec .logo i { background:var(--rec); animation:eq 0.9s infinite ease-in-out; }
+  .shell.rec .logo i:nth-child(2){ animation-delay:.15s; }
+  .shell.rec .logo i:nth-child(3){ animation-delay:.3s; }
+  @keyframes eq { 0%,100%{transform:scaleY(0.5);} 50%{transform:scaleY(1.25);} }
+  .brand .name { font-size:18px; font-weight:700; letter-spacing:-0.02em; line-height:1; }
+  .brand .name .ai {
+    color:var(--accent);
+    text-shadow:0 0 16px color-mix(in srgb, var(--accent) 45%, transparent);
+    transition:color .35s, text-shadow .35s;
   }
-  .mode-picker { position: relative; -webkit-app-region: no-drag; }
-  .mode-btn {
-    display: flex; align-items: center; gap: 10px;
-    padding: 9px 12px;
-    background: var(--bg-raised);
-    border: 1px solid var(--border-subtle);
-    border-radius: 12px;
-    color: var(--fg-primary);
-    font: 600 12px 'Inter', sans-serif;
-    letter-spacing: -0.005em;
-    cursor: pointer;
-    transition: background 0.18s, border-color 0.18s, transform 0.1s;
-    min-width: 240px;
+  .brand .sub {
+    font-size:10px; font-weight:600; letter-spacing:0.14em; text-transform:uppercase;
+    color:var(--fg-muted); margin-top:5px;
   }
-  .mode-btn:hover { background: var(--bg-raised-hi); border-color: var(--border-strong); }
-  .mode-btn:active { transform: scale(0.98); }
-  .mode-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--accent);
-    box-shadow: 0 0 10px var(--accent);
-    transition: background 0.3s, box-shadow 0.3s;
-    flex-shrink: 0;
+
+  .picker { position:relative; -webkit-app-region:no-drag; }
+  .pill {
+    display:flex; align-items:center; gap:9px; min-width:212px; max-width:300px;
+    padding:9px 11px 9px 12px; border-radius:11px; cursor:pointer;
+    background:var(--raised); border:1px solid var(--border-subtle);
+    color:var(--fg-primary); font-size:12px; font-weight:600; letter-spacing:-0.005em;
+    transition:background .16s, border-color .16s, transform .08s;
   }
-  .mode-label { flex: 1; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .mode-caret { font-size: 9px; opacity: 0.6; transition: transform 0.22s; }
-  .mode-picker.open .mode-caret { transform: rotate(180deg); }
-  .mode-menu {
-    position: absolute;
-    top: calc(100% + 8px);
-    right: 0;
-    min-width: 280px;
-    background: var(--bg-menu);
-    backdrop-filter: blur(40px) saturate(180%);
-    -webkit-backdrop-filter: blur(40px) saturate(180%);
-    border: 1px solid var(--border-subtle);
-    border-radius: 14px;
-    padding: 6px;
-    box-shadow: 0 20px 48px -8px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
-    opacity: 0;
-    transform: translateY(-6px) scale(0.97);
-    pointer-events: none;
-    transition: opacity 0.18s ease, transform 0.18s ease;
-    max-height: 380px;
-    overflow-y: auto;
-    z-index: 100;
+  .pill:hover { background:var(--raised-hi); border-color:var(--border-strong); }
+  .pill:active { transform:scale(0.985); }
+  .pill .dot {
+    width:8px; height:8px; border-radius:50%; flex-shrink:0; background:var(--accent);
+    box-shadow:0 0 9px var(--accent); transition:background .3s, box-shadow .3s;
   }
-  .mode-picker.open .mode-menu { opacity: 1; transform: none; pointer-events: auto; }
-  .mode-item {
-    display: flex; align-items: center; gap: 11px;
-    padding: 9px 12px;
-    border-radius: 9px;
-    cursor: pointer;
-    font: 500 12px/1.2 'Inter', sans-serif;
-    letter-spacing: -0.005em;
-    color: var(--fg-primary);
-    transition: background 0.12s;
-    position: relative;
+  .pill .lbl { flex:1; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .pill .caret { font-size:9px; opacity:0.55; transition:transform .2s; }
+  .picker.open .caret { transform:rotate(180deg); }
+
+  .menu {
+    position:absolute; top:calc(100% + 7px); right:0; width:286px;
+    background:rgba(17,21,30,0.96);
+    backdrop-filter:blur(26px); -webkit-backdrop-filter:blur(26px);
+    border:1px solid var(--border-subtle); border-radius:13px; padding:5px;
+    box-shadow:0 24px 50px -10px rgba(0,0,0,0.75), 0 1px 0 0 rgba(255,255,255,0.05) inset;
+    max-height:300px; overflow-y:auto; z-index:50;
+    opacity:0; transform:translateY(-6px) scale(0.98); pointer-events:none;
+    transition:opacity .16s ease, transform .16s ease;
+    -webkit-app-region:no-drag;
   }
-  .mode-item:hover { background: rgba(255, 255, 255, 0.05); }
-  .mode-item.active { background: rgba(255, 255, 255, 0.04); }
-  .mode-item.active::after {
-    content: '';
-    position: absolute;
-    right: 12px;
-    width: 4px; height: 4px;
-    border-radius: 50%;
-    background: var(--fg-secondary);
+  .picker.open .menu { opacity:1; transform:none; pointer-events:auto; }
+  .item {
+    display:flex; align-items:center; gap:10px; padding:9px 11px; border-radius:9px;
+    cursor:pointer; font-size:12px; font-weight:500; color:var(--fg-primary);
+    letter-spacing:-0.005em; position:relative; transition:background .12s;
   }
-  .mode-item .dot {
-    width: 9px; height: 9px; border-radius: 50%;
-    flex-shrink: 0;
-    box-shadow: 0 0 8px currentColor;
+  .item:hover { background:rgba(255,255,255,0.06); }
+  .item.active { background:rgba(255,255,255,0.045); }
+  .item .d { width:9px; height:9px; border-radius:50%; flex-shrink:0; box-shadow:0 0 8px currentColor; }
+  .item.active::after {
+    content:'✓'; margin-left:auto; font-size:11px; color:var(--fg-secondary);
   }
+  .menu::-webkit-scrollbar { width:6px; }
+  .menu::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.14); border-radius:3px; }
+  .menu::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,0.24); }
+
   .body {
-    padding: 14px 30px 22px 30px;
-    display: flex; align-items: center; gap: 16px;
+    display:flex; align-items:center; gap:14px;
+    padding:6px 22px 20px 22px; position:relative; z-index:1;
   }
-  .status-dot {
-    width: 12px; height: 12px; border-radius: 50%;
-    background: var(--accent);
-    box-shadow: 0 0 12px currentColor;
-    color: var(--accent);
-    transition: background 0.3s, box-shadow 0.3s, color 0.3s;
-    flex-shrink: 0;
-    position: relative;
+  .status { display:flex; align-items:center; gap:13px; flex-shrink:0; min-width:0; }
+  .sdot {
+    width:11px; height:11px; border-radius:50%; flex-shrink:0; position:relative;
+    background:var(--accent); color:var(--accent); box-shadow:0 0 11px currentColor;
+    transition:background .3s, color .3s, box-shadow .3s;
   }
-  .shell.boot .status-dot { background: var(--fg-muted); color: var(--fg-muted); }
-  .status-dot::before {
-    content: '';
-    position: absolute;
-    inset: -4px;
-    border-radius: 50%;
-    border: 1.5px solid currentColor;
-    opacity: 0;
-    transition: opacity 0.3s;
+  .shell.boot .sdot { background:var(--fg-muted); color:var(--fg-muted); animation:breathe 1.6s infinite ease-in-out; }
+  .shell.rec  .sdot { background:var(--rec); color:var(--rec); animation:pulse 1.1s infinite ease-in-out; }
+  .shell.tx   .sdot { background:var(--tx); color:var(--tx); animation:pulse 0.8s infinite ease-in-out; }
+  .shell.done .sdot { background:var(--ok); color:var(--ok); }
+  .shell.err  .sdot { background:var(--warn); color:var(--warn); }
+  .sdot::after {
+    content:''; position:absolute; inset:-5px; border-radius:50%;
+    border:1.5px solid currentColor; opacity:0;
   }
-  .shell.rec .status-dot { background: #ff3854; color: #ff3854; animation: dot-pulse 1.2s infinite ease-in-out; }
-  .shell.rec .status-dot::before { opacity: 0.5; animation: dot-ring 1.2s infinite ease-in-out; }
-  .shell.tx  .status-dot { background: #00e5ff; color: #00e5ff; animation: dot-pulse 0.8s infinite ease-in-out; }
-  .shell.tx  .status-dot::before { opacity: 0.5; animation: dot-ring 0.8s infinite ease-in-out; }
-  .shell.done .status-dot { background: #6dff8a; color: #6dff8a; }
-  .shell.err .status-dot { background: #ff8a3d; color: #ff8a3d; }
-  @keyframes dot-pulse {
-    0%, 100% { transform: scale(1); }
-    50% { transform: scale(1.2); }
+  .shell.rec .sdot::after { animation:ring 1.1s infinite ease-out; }
+  @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.22);} }
+  @keyframes breathe { 0%,100%{opacity:.4;} 50%{opacity:1;} }
+  @keyframes ring { 0%{transform:scale(.7);opacity:.6;} 100%{transform:scale(1.9);opacity:0;} }
+
+  .stext { min-width:0; }
+  .smain {
+    font-size:15px; font-weight:600; letter-spacing:-0.015em; line-height:1.2;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:330px;
   }
-  @keyframes dot-ring {
-    0% { transform: scale(0.8); opacity: 0.6; }
-    100% { transform: scale(1.8); opacity: 0; }
+  .ssub { font-size:11px; font-weight:400; color:var(--fg-secondary); margin-top:4px; letter-spacing:.005em; }
+  .ssub kbd {
+    font:600 10px 'Inter',sans-serif; background:rgba(255,255,255,0.07);
+    border:1px solid rgba(255,255,255,0.11); padding:2px 6px; border-radius:5px;
+    color:var(--fg-primary); margin:0 1px;
+    box-shadow:0 1px 0 rgba(255,255,255,0.05) inset, 0 1px 2px rgba(0,0,0,0.3);
   }
-  .status-text { flex: 1; min-width: 0; }
-  .status-main {
-    font: 600 15px 'Inter', sans-serif;
-    letter-spacing: -0.015em;
-    color: var(--fg-primary);
-    line-height: 1.2;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .status-sub {
-    font: 400 11px/1.4 'Inter', sans-serif;
-    color: var(--fg-secondary);
-    margin-top: 4px;
-    letter-spacing: 0.005em;
-  }
-  .status-sub kbd {
-    font: 600 10px 'Inter', sans-serif;
-    background: rgba(255, 255, 255, 0.07);
-    border: 1px solid rgba(255, 255, 255, 0.10);
-    padding: 2px 6px;
-    border-radius: 5px;
-    color: var(--fg-primary);
-    margin: 0 1px;
-    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 1px 2px rgba(0, 0, 0, 0.3);
-  }
-  .mode-menu::-webkit-scrollbar { width: 6px; }
-  .mode-menu::-webkit-scrollbar-track { background: transparent; }
-  .mode-menu::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 3px; }
-  .mode-menu::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
+
+  /* Waveform fuellt den rechten Teil des Body */
+  .wavewrap { flex:1; height:46px; min-width:0; position:relative; -webkit-app-region:no-drag; }
+  #wave { width:100%; height:100%; display:block; }
 </style>
 </head>
 <body>
-  <div class="shell idle" id="shell">
-    <div class="accent-stripe" id="accent-stripe"></div>
+  <div class="shell boot" id="shell">
     <div class="header">
       <div class="brand">
-        <h1><span class="ai">AI</span>bersetzer</h1>
-        <p>Sprache zu Text</p>
+        <div class="logo" id="logo"><i></i><i></i><i></i></div>
+        <div>
+          <div class="name"><span class="ai">AI</span>bersetzer</div>
+          <div class="sub">Sprache zu Text</div>
+        </div>
       </div>
-      <div class="mode-picker" id="mode-picker">
-        <button class="mode-btn" id="mode-btn" type="button">
-          <span class="mode-dot" id="mode-dot"></span>
-          <span class="mode-label" id="mode-label">__INITIAL_LABEL__</span>
-          <span class="mode-caret">▼</span>
+      <div class="picker" id="picker">
+        <button class="pill" id="pill" type="button">
+          <span class="dot" id="pdot"></span>
+          <span class="lbl" id="plbl">__INITIAL_LABEL__</span>
+          <span class="caret">▾</span>
         </button>
-        <div class="mode-menu" id="mode-menu"></div>
+        <div class="menu" id="menu"></div>
       </div>
     </div>
     <div class="body">
-      <div class="status-dot" id="status-dot"></div>
-      <div class="status-text">
-        <div class="status-main" id="status-main">Bereit</div>
-        <div class="status-sub" id="status-sub"><kbd>Strg</kbd>+<kbd>Leer</kbd>&nbsp;&nbsp;→&nbsp;&nbsp;Aufnahme</div>
+      <div class="status">
+        <div class="sdot" id="sdot"></div>
+        <div class="stext">
+          <div class="smain" id="smain">Wird geladen…</div>
+          <div class="ssub" id="ssub">Modell wird vorbereitet</div>
+        </div>
       </div>
+      <div class="wavewrap"><canvas id="wave"></canvas></div>
     </div>
   </div>
 <script>
   const MODES = __MODES_JSON__;
   let currentMode = '__INITIAL_MODE__';
-  const $shell = document.getElementById('shell');
-  const $modePicker = document.getElementById('mode-picker');
-  const $modeBtn = document.getElementById('mode-btn');
-  const $modeDot = document.getElementById('mode-dot');
-  const $modeLabel = document.getElementById('mode-label');
-  const $modeMenu = document.getElementById('mode-menu');
-  const $statusMain = document.getElementById('status-main');
-  const $statusSub = document.getElementById('status-sub');
+  let liveOverride = false;            // sobald echtes Python-Update kommt -> Demo aus
+  const $ = id => document.getElementById(id);
+  const shell=$('shell'), picker=$('picker'), pill=$('pill'), pdot=$('pdot'),
+        plbl=$('plbl'), menu=$('menu'), smain=$('smain'), ssub=$('ssub');
 
+  function accent() {
+    return getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#00e5ff';
+  }
+
+  /* ---------- Mode-Picker ---------- */
   function renderMenu() {
-    $modeMenu.innerHTML = MODES.map(m => `
-      <div class="mode-item ${m.key === currentMode ? 'active' : ''}" data-key="${m.key}">
-        <span class="dot" style="background:${m.color}; color:${m.color}"></span>
-        <span>${m.label}</span>
-      </div>`).join('');
-    $modeMenu.querySelectorAll('.mode-item').forEach(el => {
-      el.addEventListener('click', () => {
+    menu.innerHTML = MODES.map(m =>
+      `<div class="item ${m.key===currentMode?'active':''}" data-key="${m.key}">
+         <span class="d" style="background:${m.color};color:${m.color}"></span>
+         <span>${m.label}</span></div>`).join('');
+    menu.querySelectorAll('.item').forEach(el => {
+      el.addEventListener('click', e => {
+        e.stopPropagation();
         const k = el.dataset.key;
         applyMode(k);
-        $modePicker.classList.remove('open');
-        if (window.pywebview && window.pywebview.api && window.pywebview.api.set_mode) {
+        closeMenu();
+        if (window.pywebview && window.pywebview.api && window.pywebview.api.set_mode)
           window.pywebview.api.set_mode(k);
-        }
       });
     });
   }
   function applyMode(key) {
-    const m = MODES.find(x => x.key === key);
-    if (!m) return;
+    const m = MODES.find(x => x.key === key); if (!m) return;
     currentMode = key;
-    $modeLabel.textContent = m.label;
+    plbl.textContent = m.label;
     document.documentElement.style.setProperty('--accent', m.color);
-    $modeDot.style.background = m.color;
-    $modeDot.style.boxShadow = `0 0 10px ${m.color}`;
+    pdot.style.background = m.color; pdot.style.boxShadow = `0 0 9px ${m.color}`;
+    waveColor = m.color;
     renderMenu();
   }
-  $modeBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    $modePicker.classList.toggle('open');
-  });
-  document.addEventListener('click', () => $modePicker.classList.remove('open'));
+  let menuOpen = false;
+  function openMenu() {
+    if (menuOpen) return; menuOpen = true;
+    picker.classList.add('open'); menu.scrollTop = 0;
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.set_expanded)
+      window.pywebview.api.set_expanded(true);   // Fenster waechst SOFORT
+  }
+  function closeMenu() {
+    if (!menuOpen) return; menuOpen = false;
+    picker.classList.remove('open');
+    // Fenster erst NACH der Schliess-Animation verkleinern (kein Clipping)
+    setTimeout(() => {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.set_expanded)
+        window.pywebview.api.set_expanded(false);
+    }, 190);
+  }
+  pill.addEventListener('click', e => { e.stopPropagation(); menuOpen ? closeMenu() : openMenu(); });
+  document.addEventListener('click', () => { if (menuOpen) closeMenu(); });
+
+  /* ---------- Live-Waveform (ein DPR-aware Canvas, ein rAF-Loop) ---------- */
+  const cv = $('wave'), ctx = cv.getContext('2d');
+  const NB = 44;                         // Anzahl Balken
+  const bars = new Float32Array(NB);     // aktueller Wert je Balken
+  const peaks = new Float32Array(NB);    // Peak-Hold-Kappe je Balken
+  let waveColor = accent();
+  let curState = 'boot';
+  let level = 0, smooth = 0;             // realer + geglaetteter Pegel
+  let lastLevelTs = 0;                   // wann kam zuletzt ein echter Pegel?
+  let cssW = 300, cssH = 46, dpr = 1, t = 0;
+
+  function sizeCanvas() {
+    dpr = window.devicePixelRatio || 1;
+    const r = cv.getBoundingClientRect();
+    cssW = Math.max(40, r.width); cssH = Math.max(20, r.height);
+    cv.width = Math.round(cssW * dpr); cv.height = Math.round(cssH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', sizeCanvas);
+  new ResizeObserver(sizeCanvas).observe(cv);
+
+  function hexA(hex, a) {
+    const h = hex.replace('#',''); const n = parseInt(h.length===3
+      ? h.split('').map(c=>c+c).join('') : h, 16);
+    return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+  }
+  function shape(i) {                     // Glocken-Huellkurve: Mitte hoeher
+    const x = (i/(NB-1))*2 - 1; return 0.45 + 0.55*Math.cos(x*1.35);
+  }
+  function draw() {
+    t += 0.016;
+    ctx.clearRect(0, 0, cssW, cssH);
+    const mid = cssH/2, gap = cssW/NB, bw = Math.max(3.2, Math.min(6.5, gap*0.62));
+    const live = (curState === 'rec');
+    const txs  = (curState === 'tx');
+    const maxH = cssH * 0.96, GAIN = cssH * 1.75;
+
+    // Pegel glaetten (Attack schnell, Decay weich)
+    if (live) {
+      let target = level;
+      // kein echter Pegel seit 250ms -> synthetischer Oszillator, damit es lebt
+      if (t*1000 - lastLevelTs > 0.25*1000 || lastLevelTs === 0)
+        target = 0.45 + 0.32*Math.abs(Math.sin(t*4.1)) + 0.14*Math.sin(t*11.0);
+      smooth += (target - smooth) * (target > smooth ? 0.55 : 0.12);
+    } else {
+      smooth += (0 - smooth) * 0.14;
+    }
+    const txCol = getComputedStyle(document.documentElement).getPropertyValue('--tx').trim();
+
+    for (let i=0; i<NB; i++) {
+      let target;
+      if (live) {
+        const n = 0.5 + 0.5*Math.sin(t*7 + i*0.7) * Math.sin(t*2.3 + i*0.31);
+        target = Math.max(0.13, smooth * shape(i) * (0.55 + 0.7*n));   // Baseline -> immer lebendig
+      } else if (txs) {
+        const sweep = (Math.sin(t*3 - i*0.45) + 1)/2;
+        target = 0.10 + 0.26*Math.pow(sweep, 3);
+      } else {
+        target = 0.045 + 0.025*Math.sin(t*1.4 + i*0.5);   // ruhige Atemlinie
+      }
+      bars[i] += (target - bars[i]) * (target > bars[i] ? 0.5 : 0.16);
+      // Peak-Hold (snap hoch, faellt mit Gravitation)
+      if (bars[i] > peaks[i]) peaks[i] = bars[i];
+      else peaks[i] = Math.max(bars[i], peaks[i] - 0.010);
+
+      const x = i*gap + gap/2;
+      const h = Math.max(2.0, Math.min(maxH, bars[i] * GAIN));
+      const col = (live ? waveColor : (txs ? txCol : waveColor));
+      ctx.fillStyle = (live || txs) ? hexA(col, 0.95) : hexA(col, 0.32);
+      // Balken nach oben + unten gespiegelt (zentriert)
+      rr(ctx, x - bw/2, mid - h/2, bw, h, bw/2);
+      ctx.fill();
+      // Peak-Kappe nur waehrend rec, nur bei echtem Ausschlag
+      if (live && peaks[i] > 0.16) {
+        const ph = Math.min(maxH, peaks[i] * GAIN);
+        ctx.fillStyle = hexA(col, 0.7);
+        ctx.fillRect(x - bw/2, mid - ph/2 - 2.0, bw, 1.6);
+        ctx.fillRect(x - bw/2, mid + ph/2 + 0.4, bw, 1.6);
+      }
+    }
+  }
+  function rr(c, x, y, w, h, r) {
+    r = Math.min(r, w/2, h/2);
+    c.beginPath();
+    c.moveTo(x+r, y); c.arcTo(x+w, y, x+w, y+h, r); c.arcTo(x+w, y+h, x, y+h, r);
+    c.arcTo(x, y+h, x, y, r); c.arcTo(x, y, x+w, y, r); c.closePath();
+  }
+  function loop() {
+    // Hintergrund-Tab / Idle -> nicht zeichnen (spart CPU, vermeidet RAF-Throttle-Falle)
+    const animating = (curState === 'rec' || curState === 'tx');
+    if (!document.hidden && (animating || smooth > 0.005 || bars[0] > 0.05)) draw();
+    requestAnimationFrame(loop);
+  }
+
+  /* ---------- State-Render (eine Funktion fuer alle 6 States) ---------- */
+  const KBD = '<kbd>Strg</kbd>+<kbd>Leer</kbd>';
+  function render(state, msg, noKeyMsg) {
+    ['boot','idle','rec','tx','done','err'].forEach(s => shell.classList.remove(s));
+    shell.classList.add(state);
+    curState = state;
+    let main='', sub='';
+    if (state==='boot')      { main = msg || 'Wird geladen…'; sub = 'Modell wird vorbereitet'; }
+    else if (state==='idle') { main = 'Bereit'; sub = noKeyMsg || (KBD + '&nbsp;&nbsp;→&nbsp;&nbsp;Aufnahme'); }
+    else if (state==='rec')  { main = 'Aufnahme läuft'; sub = KBD + '&nbsp;&nbsp;→&nbsp;&nbsp;Stopp'; }
+    else if (state==='tx')   { main = msg || 'Wird transkribiert…'; sub = '&nbsp;'; }
+    else if (state==='done') { main = msg || 'Eingefügt'; sub = '&nbsp;'; }
+    else if (state==='err')  { main = msg || 'Fehler – Log prüfen'; sub = '&nbsp;'; }
+    smain.textContent = main; ssub.innerHTML = sub;
+  }
 
   window.v2p = {
-    setState(payload) {
-      const { state, msg, mode, noKeyMsg } = payload;
-      ['rec', 'tx', 'done', 'err', 'boot', 'idle'].forEach(s => $shell.classList.remove(s));
-      $shell.classList.add(state);
-      if (mode && mode !== currentMode) applyMode(mode);
-      let main = '', sub = '';
-      if (state === 'boot')      { main = msg || 'Wird geladen…'; sub = 'Modell wird vorbereitet'; }
-      else if (state === 'idle') {
-        main = 'Bereit';
-        sub = noKeyMsg || '<kbd>Strg</kbd>+<kbd>Leer</kbd>&nbsp;&nbsp;→&nbsp;&nbsp;Aufnahme';
-      }
-      else if (state === 'rec')  { main = 'Aufnahme läuft'; sub = '<kbd>Strg</kbd>+<kbd>Leer</kbd>&nbsp;&nbsp;→&nbsp;&nbsp;Stopp'; }
-      else if (state === 'tx')   { main = msg || 'Wird transkribiert…'; sub = ' '; }
-      else if (state === 'done') { main = msg || 'Eingefügt'; sub = ' '; }
-      else if (state === 'err')  { main = msg || 'Fehler – Log prüfen'; sub = ' '; }
-      $statusMain.textContent = main;
-      $statusSub.innerHTML = sub;
+    setState(p) {
+      liveOverride = true;
+      if (p.mode && p.mode !== currentMode) applyMode(p.mode);
+      render(p.state, p.msg || '', p.noKeyMsg || '');
     },
-    setMode(key) { applyMode(key); }
+    setLevel(x) { liveOverride = true; level = Math.max(0, Math.min(1, x)); lastLevelTs = t*1000; },
+    setLevels(a) { if (a && a.length) this.setLevel(a[a.length-1]); },
+    setMode(k) { applyMode(k); }
   };
 
-  renderMenu();
-  applyMode(currentMode);
+  /* ---------- Demo-Loop (nur bis echtes Python-Update kommt) ---------- */
+  function demo() {
+    if (liveOverride) return;
+    const seq = [
+      ['boot','Wird geladen…',900],
+      ['idle','',1600],
+      ['rec','',3200],
+      ['tx','Transkribiert…',1100],
+      ['done','✓  Beispieltext eingefügt',1500],
+    ];
+    let i = 0;
+    function step() {
+      if (liveOverride) { return; }
+      const [s,m] = seq[i % seq.length];
+      render(s, m, '');
+      // im Demo-rec einen schwingenden Pegel simulieren
+      if (s === 'rec') { let k=0; const iv=setInterval(()=>{ if(liveOverride||curState!=='rec'){clearInterval(iv);return;} level=0.3+0.45*Math.abs(Math.sin(k*0.5)); lastLevelTs=t*1000; k++; },90); }
+      const d = seq[i % seq.length][2]; i++;
+      setTimeout(step, d);
+    }
+    step();
+  }
+
+  sizeCanvas();
+  renderMenu(); applyMode(currentMode);
+  requestAnimationFrame(loop);
+  setTimeout(demo, 300);
 </script>
 </body>
 </html>
@@ -519,7 +690,24 @@ class JsAPI:
     def set_mode(self, key: str) -> None:
         if key in MODE_LABELS:
             set_mode(key)
-            overlay_set_then_idle("done", f"→ {MODE_LABELS[key]}", 700)
+            overlay_set_then_idle("done", f"→ {MODE_SHORT.get(key, key)}", 650)
+
+    def set_expanded(self, expanded) -> None:
+        """Fenster sauber vergroessern/verkleinern fuer das offene Menue.
+        Inline (Bridge-Calls sind serialisiert), dedupliziert, ohne Race-Thread
+        und ohne SetWindowRgn-Recut."""
+        w = window_ref["w"]
+        if not w:
+            return
+        want = bool(expanded)
+        with resize_lock:
+            if expanded_ref["v"] == want:
+                return
+            expanded_ref["v"] = want
+            try:
+                w.resize(OV_W, OV_H_OPEN if want else OV_H)
+            except Exception as e:
+                log.debug(f"resize failed: {e}")
 
 def build_overlay():
     """Erstellt das pywebview-Window. Muss VOR webview.start() aufgerufen werden."""
@@ -533,16 +721,17 @@ def build_overlay():
         on_top=True,
         width=OV_W,
         height=OV_H,
+        x=3384,   # DISPLAY2 (TV): 2434 + (2560-660)//2
+        y=2190,   # DISPLAY2 (TV): 2160 + 30px Abstand oben
         resizable=False,
     )
     window_ref["w"] = win
 
-    # Beim Loaded-Event den aktuellen State pushen (initial render).
     def on_loaded():
         try:
-            overlay_redraw()
+            overlay_redraw()   # initialen State in die frisch geladene UI pushen
         except Exception as e:
-            log.warning(f"on_loaded redraw: {e}")
+            log.warning(f"on_loaded: {e}")
     try:
         win.events.loaded += on_loaded
     except Exception as e:
@@ -550,9 +739,23 @@ def build_overlay():
     return win
 
 # ---------- Audio ----------
+_lvl_skip = [0]
 def audio_callback(indata, frames, t_, status) -> None:
-    if status: log.warning(f"audio status: {status}")
-    if recording: audio_q.put(indata.copy())
+    if status:
+        log.debug(f"audio status: {status}")
+    block = indata.copy()
+    # Pre-Roll-Ring immer fuettern (auch ausserhalb der Aufnahme)
+    with prebuffer_lock:
+        prebuffer.append(block)
+    if recording:
+        audio_q.put(block)
+        # Mikrofon-Pegel an die Waveform (gedrosselt — jeder 1. Block reicht @10Hz)
+        try:
+            rms = float(np.sqrt(np.mean(np.square(block))))
+            lvl = min(1.0, (rms ** 0.7) * 4.2)   # leicht komprimiert -> auch leise Sprache schlaegt sichtbar aus
+            push_level(lvl)
+        except Exception:
+            pass
 
 def write_wav(samples: np.ndarray, path: str) -> None:
     samples = np.clip(samples, -1.0, 1.0)
@@ -587,7 +790,7 @@ def load_api_key() -> None:
             with open(KEY_PATH, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith("sk-"):
+                    if line and not line.startswith("#") and line.startswith("sk-"):
                         api_key_ref["k"] = line
                         log.info("API key from api.key")
                         return
@@ -1638,36 +1841,39 @@ POLISH_SYSTEMS = {
     "justus":            POLISH_JUSTUS,
 }
 
-# Refusal-Patterns — eng gefasst, um False-Positives in normalen Outputs zu vermeiden.
-# Treffer = der Output ist (vermutlich) eine Weigerung statt Reformulierung.
+# Refusal-Patterns — bewusst ENG: nur echte Weigerungen GANZ AM ANFANG des
+# Outputs sollen greifen. Geprueft wird ausschliesslich die ERSTE Zeile (kein
+# re.MULTILINE mehr) — so loest ein "sorry" oder "ich kann nicht" MITTEN in
+# einem stilisierten Text (z.B. Justus/Besoffen) keinen Fehlalarm aus, der die
+# gute Uebersetzung verwerfen wuerde.
 REFUSAL_PATTERNS = [
-    # Klassische Refusal-Eroeffnungen direkt am Anfang
-    r"^\s*(?:tut mir leid|sorry|leider)[,\s].{0,80}?(?:nicht\s+(?:helfen|weiterhelfen|formulieren|machen|umformulieren|reformulieren|moeglich|möglich|in\s+der\s+lage)|kann\s+ich\s+(?:dir|das|es|leider)?\s*nicht|nicht\s+kann)",
-    r"^\s*ich\s+(?:kann|darf|werde|möchte|moechte|will)\s+(?:dir|damit|das|es|hier)\s*(?:dabei\s+)?nicht\s+(?:helfen|weiterhelfen|machen|formulieren|umformulieren|reformulieren|weiter)",
-    r"^\s*ich\s+(?:kann|darf|werde)\s+das\s+nicht\b",
+    # "Tut mir leid / Sorry / Leider ... ich kann nicht helfen/formulieren ..."
+    r"^\s*(?:tut mir leid|sorry|leider)[,\s].{0,80}?(?:nicht\s+(?:helfen|weiterhelfen|formulieren|umformulieren|reformulieren|moeglich|möglich|in\s+der\s+lage)|kann\s+ich\s+(?:dir|damit)?\s*(?:dabei\s+)?nicht\s+(?:helfen|formulieren))",
+    # "Ich kann/darf/möchte (dir/damit/hier) (dabei) nicht helfen/formulieren ..."
+    r"^\s*ich\s+(?:kann|darf|möchte|moechte|werde)\s+(?:dir|damit|hier|das|es)?\s*(?:dabei\s+)?nicht\s+(?:helfen|weiterhelfen|formulieren|umformulieren|reformulieren)",
+    # "Ich kann dabei/hier/leider/dir nicht helfen/weiter(helfen)"
     r"^\s*ich\s+kann\s+(?:dabei|hier|leider|dir)\s+nicht\s+(?:helfen|weiter|weiterhelfen)",
+    # "Leider kann ich (dir) (damit) nicht helfen/weiter(helfen)"
     r"^\s*leider\s+kann\s+ich\s+(?:dir|das|es)?\s*(?:damit\s+)?nicht\s+(?:helfen|weiter|weiterhelfen)",
-    # Englische Refusal-Eroeffnungen (auch wenn "Sorry," davorsteht)
-    r"^\s*(?:sorry[,\s]+)?(?:i'?m\s+sorry|i\s+can'?t|i\s+cannot|i\s+won'?t|i'?m\s+(?:not\s+able|unable)|i\s+am\s+(?:not\s+able|unable))\b",
-    # KI-Selbstreferenz als Refusal-Marker
-    r"\bals\s+(?:ki|ai|sprachmodell|assistent|assistant|language\s+model)\b.{0,80}?(?:nicht|kann\s+ich)",
-    # Klassische Meta-Eroeffnungen (kein eigentlicher Output)
-    r"^\s*(?:hier\s+ist\s+(?:die|der|deine|eine)\s+(?:reformulierung|umformulierung|version|nachricht|antwort|umsetzung)|reformulierung:|umformulierung:|nachricht:|antwort:)",
-    # Klaerungsfragen am Stueck-Anfang (auch verboten)
-    r"^\s*(?:k(?:oe|ö)nntest\s+du|kannst\s+du|magst\s+du|w(?:ue|ü)rdest\s+du)\s+(?:mir\s+)?(?:bitte\s+)?(?:mehr|noch|genauer|kontext|details|n(?:ae|ä)her|pr(?:ae|ä)zisieren)",
-    r"^\s*(?:an\s+wen|f(?:ue|ü)r\s+wen|wer\s+ist\s+der?\s+(?:empf(?:ae|ä)nger|adressat))",
-    # Bewertende Meta-Sicherheits-Phrasen
-    r"^\s*(?:vorsicht|bitte\s+beachte|aus\s+sicherheits|aus\s+rechts|aus\s+moral)",
+    # Englische Refusals — Objekt nach can't/cannot verlangt (sonst trifft es "I can't make it tonight")
+    r"^\s*(?:sorry[,\s]+)?(?:i'?m\s+sorry|i\s+can(?:'?t|not)\s+(?:help|assist|do|create|write|generate|comply|provide|produce)|i\s+won'?t|i'?m\s+(?:not\s+able|unable)|i\s+am\s+(?:not\s+able|unable))\b",
+    # "Als KI / Sprachmodell ... kann ich nicht ..."
+    r"^\s*als\s+(?:ki|ai|sprachmodell|assistent|assistant|language\s+model)\b.{0,80}?(?:nicht|kann\s+ich)",
+    # Meta-Eroeffnungen ("Hier ist die Reformulierung:" — sowas diktiert niemand)
+    r"^\s*(?:hier\s+ist\s+(?:die|der|deine|eine)\s+(?:reformulierung|umformulierung|umsetzung)|reformulierung:|umformulierung:)",
+    # Klare Sicherheits-/Rechts-Weigerung
+    r"^\s*aus\s+(?:sicherheits|rechtlich|moralisch|ethisch)",
 ]
-REFUSAL_RE = re.compile("|".join(f"(?:{p})" for p in REFUSAL_PATTERNS), re.IGNORECASE | re.MULTILINE)
+REFUSAL_RE = re.compile("|".join(f"(?:{p})" for p in REFUSAL_PATTERNS), re.IGNORECASE)
 
 def looks_like_refusal(out: str) -> bool:
-    """True wenn der Output wie eine Refusal/Klaerungsfrage/Meta-Antwort aussieht."""
+    """True wenn der Output wie eine Refusal/Klaerungsfrage/Meta-Antwort aussieht.
+    Nur die ERSTE nicht-leere Zeile wird geprueft — echte Weigerungen eroeffnen
+    immer damit, stilisierte Texte praktisch nie."""
     if not out or not out.strip():
         return True
-    # Nur die ersten ~300 Zeichen scannen — eine echte Refusal kommt fast immer vorne.
-    head = out.strip()[:300]
-    return bool(REFUSAL_RE.search(head))
+    first_line = next((ln for ln in out.strip().splitlines() if ln.strip()), "")
+    return bool(REFUSAL_RE.match(first_line.strip()))
 
 def polish(text: str, mode: str = "coding") -> str:
     """Schickt rohen Text durch Claude Haiku. Bei Fehler / kein Key / mode=off / Refusal: gibt cleanen Rohtext zurueck."""
@@ -1717,8 +1923,8 @@ def polish(text: str, mode: str = "coding") -> str:
         dt = time.time() - t0
         log.info(f"polish[{mode}] {dt:.1f}s, in={len(text)} out={len(out)}")
 
-        # Refusal-Check: wenn das LLM trotz Anti-Refusal-Klausel verweigert
-        # oder eine Klaerungsfrage stellt, einmal mit verschaerftem Hint nachtreten.
+        # Refusal-Check: nur bei echtem Verdacht (erste Zeile). Dann EINMAL
+        # verschaerft nachtreten, sonst cleanen Rohtext (nie eine sichtbare Weigerung).
         if looks_like_refusal(out):
             log.warning(f"polish[{mode}] refusal/meta detected: {out[:140]!r} — retry")
             retry_user = (
@@ -1733,14 +1939,13 @@ def polish(text: str, mode: str = "coding") -> str:
                 "Eine Refusal ist KEIN gueltiger Output."
             )
             try:
-                # Etwas hoehere Temperatur — bricht oft die Refusal-Spur.
                 out2 = call(retry_user, min(1.0, base_temp + 0.3))
                 if out2 and not looks_like_refusal(out2):
                     log.info(f"polish[{mode}] retry success ({len(out2)} chars)")
                     out = out2
                 else:
                     log.warning(f"polish[{mode}] retry also refused — fallback to raw clean text")
-                    return text  # cleanen Rohtext einfuegen, NIE Refusal/Fehlermeldung
+                    return text
             except Exception as e:
                 log.warning(f"polish[{mode}] retry call failed: {e} — fallback to raw")
                 return text
@@ -1750,11 +1955,12 @@ def polish(text: str, mode: str = "coding") -> str:
         log.warning(f"polish failed: {e}")
         return text
 
-# ---------- Tray-Icon (nur als Beenden-Knopf + zweiter Status) ----------
+# ---------- Tray-Icon (Beenden-Knopf + zweiter Status) ----------
 def make_tray_icon(state: str) -> Image.Image:
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    color = {"rec": (220, 50, 50), "tx": (50, 140, 220), "idle": (140, 140, 140), "boot": (90, 90, 90), "done": (60, 180, 100), "err": (220, 140, 30)}.get(state, (140,140,140))
+    color = {"rec": (255, 59, 84), "tx": (56, 217, 255), "idle": (140, 140, 140),
+             "boot": (90, 90, 90), "done": (94, 240, 138), "err": (255, 157, 66)}.get(state, (140, 140, 140))
     d.ellipse((2, 2, 62, 62), fill=color)
     d.rounded_rectangle((26, 16, 38, 40), radius=6, fill=(255, 255, 255))
     d.rectangle((30, 40, 34, 50), fill=(255, 255, 255))
@@ -1764,13 +1970,16 @@ def make_tray_icon(state: str) -> Image.Image:
 def set_tray(state: str, tooltip: str) -> None:
     t = tray_ref["t"]
     if t:
-        t.icon = make_tray_icon(state)
-        t.title = f"{APP_NAME} — {tooltip}"
+        try:
+            t.icon = make_tray_icon(state)
+            t.title = f"{APP_NAME} — {tooltip}"
+        except Exception as e:
+            log.debug(f"set_tray failed: {e}")
 
 # ---------- Whisper ----------
 def load_model() -> WhisperModel:
-    log.info(f"loading model {MODEL_SIZE}")
-    m = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+    log.info(f"loading model {MODEL_SIZE} ({COMPUTE_TYPE})")
+    m = WhisperModel(MODEL_SIZE, device="cpu", compute_type=COMPUTE_TYPE)
     log.info("model ready")
     return m
 
@@ -1778,53 +1987,78 @@ def transcribe(wav_path: str) -> str:
     m = model_ref["m"]
     segments, _ = m.transcribe(
         wav_path, language=LANGUAGE, vad_filter=False, beam_size=5,
-        no_speech_threshold=0.6,
+        no_speech_threshold=0.6, condition_on_previous_text=False,
     )
     return " ".join(s.text.strip() for s in segments if s.text and s.text.strip())
 
 # ---------- Aufnahme-Logik ----------
-def paste_clipboard() -> None:
-    time.sleep(0.12)
+def paste_clipboard(prev_clip: str = None) -> None:
+    # Das physisch gehaltene Strg/Leer (vom Hotkey) erst loslassen, sonst
+    # frisst Windows das Strg+V (haeufige Ursache fuer "nichts wird eingefuegt").
+    try:
+        keyboard.release("space"); keyboard.release("ctrl")
+    except Exception:
+        pass
+    time.sleep(0.18)
     keyboard.send("ctrl+v")
+    # Vorherigen Clipboard-Inhalt nach kurzem Moment wiederherstellen.
+    if prev_clip is not None:
+        def restore():
+            time.sleep(0.8)
+            try: pyperclip.copy(prev_clip)
+            except Exception: pass
+        threading.Thread(target=restore, daemon=True).start()
+
+preroll_snap = []   # Audio-Bloecke kurz VOR dem Start-Tap (kein abgeschnittenes erstes Wort)
 
 def handle_toggle() -> None:
-    global recording
+    global recording, transcribing
     if model_ref["m"] is None:
         log.info("toggle ignored — model loading")
         overlay_set("boot", "Modell wird geladen…")
         return
 
-    if not recording:
+    with toggle_lock:
+        if transcribing:
+            log.info("toggle ignored — transcription in flight")
+            return
+        if not recording:
+            # START: stale Audio leeren, Pre-Roll schnappen, einschalten — alles unter Lock
+            while not audio_q.empty():
+                try: audio_q.get_nowait()
+                except queue.Empty: break
+            with prebuffer_lock:
+                preroll_snap[:] = list(prebuffer)
+            recording = True
+            rec_start[0] = time.monotonic()
+            overlay_set("rec")
+            set_tray("rec", f"Aufnahme · {MODE_SHORT.get(polish_mode, polish_mode)}")
+            log.info("REC start")
+            return
+        # STOP-Versuch:
+        if time.monotonic() - rec_start[0] < MIN_REC_SEC:
+            # versehentlicher Doppel-Tap -> weiter aufnehmen statt leeres Ergebnis
+            log.info("stop ignored — under MIN_REC_SEC, keep recording")
+            return
+        recording = False
+        transcribing = True
+        chunks = list(preroll_snap)
         while not audio_q.empty():
-            try: audio_q.get_nowait()
+            try: chunks.append(audio_q.get_nowait())
             except queue.Empty: break
-        recording = True
-        overlay_set("rec")
-        set_tray("rec", f"Aufnahme · {MODE_SHORT.get(polish_mode, polish_mode)}")
-        log.info("REC start")
-        return
 
-    recording = False
-    overlay_set("tx")
-    set_tray("tx", "Wird transkribiert…")
-    log.info("REC stop, transcribing")
-    chunks = []
-    while not audio_q.empty():
-        try: chunks.append(audio_q.get_nowait())
-        except queue.Empty: break
-    if not chunks:
-        log.info("no audio")
-        overlay_set("idle")
-        return
-    samples = np.concatenate(chunks, axis=0).flatten()
-    if samples.size < SAMPLE_RATE // 4:
-        log.info("audio < 0.25s — silent skip")
-        overlay_set("idle")
-        return
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav_path = f.name
+    # ---- schwere Arbeit AUSSERHALB des Locks ----
+    wav_path = None
     try:
+        overlay_set("tx"); set_tray("tx", "Wird transkribiert…")
+        if not chunks:
+            log.info("no audio"); overlay_set("idle"); return
+        samples = np.concatenate(chunks, axis=0).flatten()
+        if samples.size < SAMPLE_RATE // 4:
+            log.info("audio < 0.25s — silent skip"); overlay_set("idle"); return
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
         write_wav(samples, wav_path)
         t0 = time.time()
         raw = transcribe(wav_path)
@@ -1832,53 +2066,53 @@ def handle_toggle() -> None:
         clean = light_cleanup(raw)
         log.info(f"transcribed {dt:.1f}s -> {len(clean)} chars: {clean[:120]!r}")
         if not clean:
-            log.info("whisper output empty, silent skip")
-            overlay_set("idle")
-            return
-        # LLM-Polish wenn Key da UND Mode != off, sonst raw
+            log.info("whisper output empty, silent skip"); overlay_set("idle"); return
+
         if api_key_ref["k"] and polish_mode != "off":
-            label = f"{MODE_SHORT.get(polish_mode, polish_mode)}-Polish …"
-            overlay_set("tx", label)
+            overlay_set("tx", f"{MODE_SHORT.get(polish_mode, polish_mode)}-Polish …")
             final = polish(clean, polish_mode)
         else:
             final = clean
+
+        prev_clip = None
+        try: prev_clip = pyperclip.paste()
+        except Exception: pass
         pyperclip.copy(final)
-        paste_clipboard()
-        preview = final if len(final) <= 40 else final[:38] + ".."
-        overlay_set_then_idle("done", f"✓  {preview}", 1500)
+        paste_clipboard(prev_clip)
+        overlay_set_then_idle("done", f"✓  {_short_preview(final)}", 1500)
         set_tray("done", f"OK · {final[:60]}")
     except Exception as e:
         log.exception(f"transcribe failed: {e}")
         overlay_set_then_idle("err", "Fehler – Log prüfen", 2000)
         set_tray("err", "Fehler")
     finally:
-        try: os.remove(wav_path)
-        except OSError: pass
+        with toggle_lock:
+            transcribing = False
+        if wav_path:
+            try: os.remove(wav_path)
+            except OSError: pass
 
-# ---------- RegisterHotKey im eigenen Thread ----------
-hotkey_tid = {"v": 0}
-
+# ---------- Modus ----------
 def set_mode(target: str) -> None:
-    """Setzt Modus direkt (vom Drop-Down aufgerufen)."""
+    """Setzt Modus direkt (vom Drop-Down aufgerufen) und merkt ihn fuer den Neustart."""
     global polish_mode
     if target not in MODE_LABELS:
         log.warning(f"unknown mode {target!r}")
         return
-    if not api_key_ref["k"] and target not in ("off", "coding"):
-        # Polish-Modi brauchen API-Key. Coding ist die Ausnahme weil viele es
-        # auch ohne Key gerade so brauchbar finden — wir lassen es zu, aber
-        # ohne Key passiert in polish() eh nur raw paste.
-        pass
     polish_mode = target
+    save_settings(mode=target)
     log.info(f"polish_mode -> {polish_mode}")
 
+# ---------- RegisterHotKey im eigenen Thread ----------
+hotkey_tid = {"v": 0}
+
 def hotkey_loop() -> None:
-    hotkey_tid["v"] = ctypes.windll.kernel32.GetCurrentThreadId()
-    ok1 = user32.RegisterHotKey(None, HOTKEY_ID_REC, MOD_CONTROL | MOD_NOREPEAT, VK_SPACE)
-    if not ok1:
+    hotkey_tid["v"] = kernel32.GetCurrentThreadId()
+    ok = user32.RegisterHotKey(None, HOTKEY_ID_REC, MOD_CONTROL | MOD_NOREPEAT, VK_SPACE)
+    if not ok:
         err = ctypes.get_last_error()
         log.error(f"RegisterHotKey REC FAILED, code={err}")
-        overlay_set("err", f"Hotkey REC blockiert ({err})")
+        overlay_set("err", "Hotkey Strg+Leer belegt — Tool neu starten")
         return
     log.info("hotkey REC=Ctrl+Space bound")
     overlay_set("idle")
@@ -1888,7 +2122,8 @@ def hotkey_loop() -> None:
     try:
         while True:
             ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if ret <= 0: break
+            if ret <= 0:
+                break
             if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID_REC:
                 log.info("HOTKEY rec fired")
                 threading.Thread(target=handle_toggle, daemon=True).start()
@@ -1900,14 +2135,20 @@ def hotkey_loop() -> None:
 def run_tray() -> None:
     def cb_quit(icon, item):
         global stop_signal
+        log.info("quit requested")
         stop_signal = True
-        try: user32.PostThreadMessageW(hotkey_tid["v"], 0x0012, 0, 0)
+        try: user32.PostThreadMessageW(hotkey_tid["v"], WM_QUIT, 0, 0)
         except Exception: pass
-        icon.stop()
+        try:
+            w = window_ref["w"]
+            if w: w.destroy()
+        except Exception: pass
+        try: icon.stop()
+        except Exception: pass
         os._exit(0)
 
     menu = pystray.Menu(
-        pystray.MenuItem("Status & Modus-Wahl im Overlay oben", lambda i,m: None, enabled=False),
+        pystray.MenuItem("Status & Modus-Wahl im Overlay oben", lambda i, m: None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Beenden", cb_quit),
     )
@@ -1915,39 +2156,56 @@ def run_tray() -> None:
     tray_ref["t"] = icon
     icon.run()
 
-# ---------- Audio-Stream im eigenen Thread ----------
+# ---------- Audio-Stream im eigenen Thread (mit Auto-Restart) ----------
 def audio_runner() -> None:
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
-                        dtype="float32", callback=audio_callback):
-        while not stop_signal:
-            time.sleep(0.1)
+    while not stop_signal:
+        try:
+            with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                                dtype="float32", blocksize=BLOCKSIZE,
+                                latency="low", callback=audio_callback):
+                log.info("audio stream open")
+                while not stop_signal:
+                    time.sleep(0.1)
+        except Exception as e:
+            log.warning(f"audio stream error: {e} — restart in 1.5s")
+            time.sleep(1.5)
 
 # ---------- main ----------
 def main() -> None:
+    if not acquire_single_instance():
+        log.info("another instance already running — exiting")
+        try:
+            user32.MessageBoxW(
+                None,
+                "AIbersetzer läuft bereits (Symbol unten rechts in der Taskleiste).",
+                APP_NAME, 0x40)  # MB_ICONINFORMATION
+        except Exception:
+            pass
+        return
+
     log.info(f"=== {APP_NAME} start ===")
     load_api_key()
-    log.info(f"polish: {'AKTIV (Claude '+POLISH_MODEL+')' if api_key_ref['k'] else 'AUS (kein API-Key)'}")
+    log.info(f"polish: {'AKTIV (Claude ' + POLISH_MODEL + ')' if api_key_ref['k'] else 'AUS (kein API-Key)'}")
 
-    # WebView-Fenster bauen (blockt nicht — startet erst bei webview.start()).
     build_overlay()
 
-    # Background-Threads: Tray, Audio, Model-Loader, Hotkey.
     threading.Thread(target=run_tray, daemon=True).start()
     threading.Thread(target=audio_runner, daemon=True).start()
 
     def loader():
         try:
+            overlay_set("boot", "Modell wird geladen…")
             model_ref["m"] = load_model()
             overlay_set("idle")
             set_tray("idle", "bereit")
         except Exception as e:
             log.exception(f"model load failed: {e}")
-            overlay_set("err", "Modell-Fehler — log pruefen")
+            overlay_set("err", "Modell-Fehler — Log prüfen")
+            set_tray("err", "Modell-Fehler")
     threading.Thread(target=loader, daemon=True).start()
 
     threading.Thread(target=hotkey_loop, daemon=True).start()
 
-    # WebView starten — blockt bis Window geschlossen / app beendet.
     try:
         webview.start(gui="edgechromium", debug=False)
     except KeyboardInterrupt:
