@@ -200,16 +200,38 @@ def acquire_single_instance() -> bool:
 
 # ---------- Overlay (pywebview, Command-Bar-UI mit Live-Waveform) ----------
 # UI rendert in Edge WebView2 (Windows-native). KEIN Google-Fonts-CDN (System-
-# Fontstack inline -> kein First-Paint-Blocker). KEIN SetWindowRgn mehr noetig:
-# transparent=True + CSS border-radius liefern saubere runde Ecken ganz ohne
-# GDI-Regionen (das beseitigt Region-Recut-Flacker, GDI-Leak, DPI-Mismatch).
+# Fontstack inline -> kein First-Paint-Blocker).
+# WICHTIG: pywebview/WebView2-Transparenz ist auf diesem Setup NICHT zuverlaessig
+# (Fenster wurde weiss statt durchsichtig). Deshalb formen wir das OS-Fenster
+# selbst rund: die Karte FUELLT das Fenster opak, SetWindowRgn clippt es auf ein
+# abgerundetes Rechteck. So schwebt es sauber, runde Ecken stimmen, kein weisser
+# Kasten — unabhaengig von der WebView-Transparenz.
 OV_W       = 660
-OV_H       = 172    # kompakt (Menue zu)
-OV_H_OPEN  = 432    # aufgeklappt (Menue offen) — Fenster waechst sauber per resize()
+OV_H       = 138    # kompakt (Menue zu) — Karte fuellt das Fenster
+OV_H_OPEN  = 412    # aufgeklappt (Menue offen) — Fenster waechst per resize()
+CORNER_R   = 22     # Eckenradius (CSS border-radius UND SetWindowRgn identisch)
 
 window_ref = {"w": None}
+hwnd_ref   = {"h": 0}
 expanded_ref = {"v": False}
 resize_lock = threading.Lock()
+
+def apply_region(hwnd: int, w: int, h: int) -> None:
+    """Clippt das OS-Fenster auf ein abgerundetes Rechteck (DPI-korrekt, leak-sicher)."""
+    if not hwnd:
+        return
+    try:
+        dpi = ctypes.windll.user32.GetDpiForWindow(hwnd) or 96
+        scale = dpi / 96.0
+        pw, ph = int(round(w * scale)), int(round(h * scale))
+        ell = int(round(CORNER_R * scale)) * 2   # CreateRoundRectRgn: Ellipsen-Breite/Hoehe = 2*Radius
+        rgn = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, pw + 1, ph + 1, ell, ell)
+        if rgn:
+            if not ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True):
+                ctypes.windll.gdi32.DeleteObject(rgn)   # nur loeschen wenn NICHT uebernommen
+        log.info(f"region {pw}x{ph} ell={ell} dpi={dpi}")
+    except Exception as e:
+        log.warning(f"apply_region: {e}")
 
 def _short_preview(text: str, n: int = 40) -> str:
     return text if len(text) <= n else text[:n - 1] + "…"
@@ -275,31 +297,27 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   * { margin:0; padding:0; box-sizing:border-box; }
   html, body {
-    width:100vw; height:100vh; background:transparent; overflow:hidden;
+    width:100vw; height:100vh; background:#0d1018; overflow:hidden;
     user-select:none; cursor:default;
     font-family:'Inter','Segoe UI Variable Display','Segoe UI',system-ui,sans-serif;
     font-feature-settings:'cv02','cv03','cv11','ss01';
     -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
     color:var(--fg-primary);
   }
-  /* Fenster ist bei offenem Menue hoch; die Karte sitzt oben, der Rest ist
-     transparent. Deshalb Body als Top-Flex statt zentriert. */
-  body { display:flex; align-items:flex-start; justify-content:center; }
+  /* Die Karte FUELLT das Fenster (kein Rand). Das OS-Fenster wird per
+     SetWindowRgn rund geclippt -> die opake Karte IST die schwebende Form. */
+  body { display:block; }
 
   .shell {
     position:relative;
-    width:calc(100vw - 14px);
-    margin:7px;
+    width:100vw; height:100vh;
     border-radius:22px;
-    background:
-      linear-gradient(168deg, rgba(20,24,34,0.92) 0%, rgba(12,15,23,0.94) 100%);
-    backdrop-filter:blur(22px);
-    -webkit-backdrop-filter:blur(22px);
-    border:1px solid var(--border-subtle);
+    background:linear-gradient(168deg, #161a24 0%, #0d1018 100%);
+    border:1px solid rgba(255,255,255,0.10);
     box-shadow:
-      0 22px 52px -12px rgba(0,0,0,0.72),
-      0 1px 0 0 rgba(255,255,255,0.06) inset;
-    overflow:visible;
+      0 1px 0 0 rgba(255,255,255,0.07) inset,
+      0 0 0 1px rgba(0,0,0,0.5) inset;
+    overflow:hidden;
     -webkit-app-region:drag;
   }
   /* 2px Akzent-Lichtkante ganz oben — der EINZIGE flaechige Akzent */
@@ -365,20 +383,20 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   .pill .lbl { flex:1; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .pill .caret { font-size:9px; opacity:0.55; transition:transform .2s; }
-  .picker.open .caret { transform:rotate(180deg); }
+  .shell.menuopen .caret { transform:rotate(180deg); }
 
+  /* Menue fuellt als Palette-Panel den unteren Kartenbereich (Fenster ist dann hoch) */
   .menu {
-    position:absolute; top:calc(100% + 7px); right:0; width:286px;
-    background:rgba(17,21,30,0.96);
-    backdrop-filter:blur(26px); -webkit-backdrop-filter:blur(26px);
-    border:1px solid var(--border-subtle); border-radius:13px; padding:5px;
-    box-shadow:0 24px 50px -10px rgba(0,0,0,0.75), 0 1px 0 0 rgba(255,255,255,0.05) inset;
-    max-height:300px; overflow-y:auto; z-index:50;
-    opacity:0; transform:translateY(-6px) scale(0.98); pointer-events:none;
+    position:absolute; left:12px; right:12px; top:66px; bottom:12px;
+    background:#10141d;
+    border:1px solid rgba(255,255,255,0.07); border-radius:14px; padding:6px;
+    overflow-y:auto; z-index:50;
+    opacity:0; transform:translateY(-6px); pointer-events:none;
     transition:opacity .16s ease, transform .16s ease;
     -webkit-app-region:no-drag;
   }
-  .picker.open .menu { opacity:1; transform:none; pointer-events:auto; }
+  .shell.menuopen .menu { opacity:1; transform:none; pointer-events:auto; }
+  .shell.menuopen .body { visibility:hidden; opacity:0; }
   .item {
     display:flex; align-items:center; gap:10px; padding:9px 11px; border-radius:9px;
     cursor:pointer; font-size:12px; font-weight:500; color:var(--fg-primary);
@@ -452,7 +470,6 @@ HTML_TEMPLATE = r"""<!doctype html>
           <span class="lbl" id="plbl">__INITIAL_LABEL__</span>
           <span class="caret">▾</span>
         </button>
-        <div class="menu" id="menu"></div>
       </div>
     </div>
     <div class="body">
@@ -465,6 +482,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
       <div class="wavewrap"><canvas id="wave"></canvas></div>
     </div>
+    <div class="menu" id="menu"></div>
   </div>
 <script>
   const MODES = __MODES_JSON__;
@@ -507,13 +525,13 @@ HTML_TEMPLATE = r"""<!doctype html>
   let menuOpen = false;
   function openMenu() {
     if (menuOpen) return; menuOpen = true;
-    picker.classList.add('open'); menu.scrollTop = 0;
     if (window.pywebview && window.pywebview.api && window.pywebview.api.set_expanded)
       window.pywebview.api.set_expanded(true);   // Fenster waechst SOFORT
+    shell.classList.add('menuopen'); menu.scrollTop = 0;
   }
   function closeMenu() {
     if (!menuOpen) return; menuOpen = false;
-    picker.classList.remove('open');
+    shell.classList.remove('menuopen');
     // Fenster erst NACH der Schliess-Animation verkleinern (kein Clipping)
     setTimeout(() => {
       if (window.pywebview && window.pywebview.api && window.pywebview.api.set_expanded)
@@ -693,9 +711,8 @@ class JsAPI:
             overlay_set_then_idle("done", f"→ {MODE_SHORT.get(key, key)}", 650)
 
     def set_expanded(self, expanded) -> None:
-        """Fenster sauber vergroessern/verkleinern fuer das offene Menue.
-        Inline (Bridge-Calls sind serialisiert), dedupliziert, ohne Race-Thread
-        und ohne SetWindowRgn-Recut."""
+        """Fenster fuers Menue vergroessern/verkleinern + Region neu clippen.
+        Inline (Bridge-Calls sind serialisiert), dedupliziert, einmal pro Toggle."""
         w = window_ref["w"]
         if not w:
             return
@@ -704,8 +721,10 @@ class JsAPI:
             if expanded_ref["v"] == want:
                 return
             expanded_ref["v"] = want
+            h = OV_H_OPEN if want else OV_H
             try:
-                w.resize(OV_W, OV_H_OPEN if want else OV_H)
+                w.resize(OV_W, h)
+                apply_region(hwnd_ref["h"], OV_W, h)   # runde Ecken auf neue Hoehe
             except Exception as e:
                 log.debug(f"resize failed: {e}")
 
@@ -730,6 +749,11 @@ def build_overlay():
     def on_loaded():
         try:
             overlay_redraw()   # initialen State in die frisch geladene UI pushen
+            # OS-Fenster auf abgerundetes Rechteck clippen (Transparenz unzuverlaessig)
+            hwnd = ctypes.windll.user32.FindWindowW(None, APP_NAME)
+            if hwnd:
+                hwnd_ref["h"] = hwnd
+                apply_region(hwnd, OV_W, OV_H)
         except Exception as e:
             log.warning(f"on_loaded: {e}")
     try:
@@ -1905,15 +1929,21 @@ def polish(text: str, mode: str = "coding") -> str:
         f"Wenn unklar — trotzdem reformulieren."
     )
 
+    # Opus 4.7/4.8 akzeptieren temperature/top_p/top_k NICHT mehr -> HTTP 400.
+    # Deshalb temperature nur senden, wenn das Modell KEIN Opus 4.7/4.8 ist.
+    _no_temp = POLISH_MODEL.startswith(("claude-opus-4-7", "claude-opus-4-8"))
+
     def call(user_msg: str, temperature: float) -> str:
         client = anthropic.Anthropic(api_key=api_key_ref["k"])
-        resp = client.messages.create(
+        kwargs = dict(
             model=POLISH_MODEL,
             max_tokens=2000,
-            temperature=temperature,
             system=sys_prompt,
             messages=[{"role": "user", "content": user_msg}],
         )
+        if not _no_temp:
+            kwargs["temperature"] = temperature
+        resp = client.messages.create(**kwargs)
         return "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
 
     base_temp = MODE_TEMPERATURE.get(mode, 0.3)

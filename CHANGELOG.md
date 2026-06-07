@@ -2,6 +2,24 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-06-07 – Nachbesserung: weißer Kasten weg + Opus-API-Schutz
+
+**Was war kaputt:**
+Nach dem Umbau schwebte das Overlay nicht, sondern erzeugte einen großen weißen
+Kasten mit eckigen Ecken. Grund: ich hatte mich auf ein „durchsichtiges Fenster"
+verlassen – das funktioniert auf diesem WebView2/PC aber nicht (wird weiß statt
+transparent).
+
+**Was jetzt anders ist:**
+- **Echt schwebend, runde Ecken.** Das OS-Fenster wird wieder selbst rund
+  geschnitten (SetWindowRgn), die Karte füllt es opak. Kein weißer Kasten mehr,
+  alle vier Ecken sauber rund – verifiziert per echtem Bildschirm-Screenshot.
+- **Mode-Liste als Palette.** Beim Aufklappen wächst das Panel und die 13 Modi
+  füllen es als saubere Liste (statt klein in der Ecke zu schweben).
+- **Opus-Schutz in der Polish-API.** Falls als Polish-Modell Opus 4.7/4.8
+  eingestellt wird, wird `temperature` weggelassen (die akzeptieren das nicht
+  mehr → sonst HTTP-400-Absturz). Standard (Haiku 4.5) unverändert.
+
 ## 2026-06-07 – Grundüberholung: hört auf zu buggen + neues Profi-Design
 
 Das große Aufräumen. Zwei Ziele: nicht mehr ständig spinnen, und endlich
