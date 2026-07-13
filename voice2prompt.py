@@ -907,6 +907,10 @@ def light_cleanup(text: str) -> str:
     t = text.strip()
     for pat in FILLERS:
         t = re.sub(pat, "", t, flags=re.IGNORECASE)
+    # Whisper-Artefakte an Segmentgrenzen (48x in den Logs): ",," / ".," / ",." -> ein Zeichen.
+    t = re.sub(r",\s*,+", ",", t)
+    t = re.sub(r"\.\s*,", ".", t)
+    t = re.sub(r",\s*\.(?!\.)", ".", t)   # "..." (Ellipse) in Ruhe lassen
     t = re.sub(r"\s+([,.;:!?])", r"\1", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
     if t and t[-1] not in ".!?": t += "."
@@ -2148,6 +2152,12 @@ _DEFAULT_VOCAB = [
      "aliases": ["cloud ai", "klaut ki", "claude ai"]},
     {"canonical": "GitHub", "fuzzy": False,
      "aliases": ["github", "git hub", "git-hub", "gitup", "githab"]},
+    # "einloggen" verhoert Whisper bei DE-Diktat notorisch als "einlocken" (4x in
+    # echten Logs beobachtet) — generisch genug fuer die Default-Liste.
+    {"canonical": "eingeloggt", "fuzzy": False, "aliases": ["eingelockt"]},
+    {"canonical": "ausgeloggt", "fuzzy": False, "aliases": ["ausgelockt"]},
+    {"canonical": "logg mich ein", "fuzzy": False, "aliases": ["lock mich ein"]},
+    {"canonical": "logg dich ein", "fuzzy": False, "aliases": ["lock dich ein"]},
 ]
 
 def load_vocab() -> list:
@@ -2225,7 +2235,10 @@ def load_model() -> WhisperModel:
     # Kandidaten in Reihenfolge: zuerst die erkannte (GPU), dann CPU-Fallback mit
     # kleinerem Modell. Pro Kandidat ein Smoke-Test (0.1 s Stille) — der deckt
     # fehlende CUDA-DLLs SOFORT auf, statt erst beim ersten echten Diktat zu crashen.
-    candidates = [(DEVICE, COMPUTE_TYPE, MODEL_SIZE)]
+    # Auf CPU direkt das kleinere Modell — large-v3 auf CPU ist fuer fluessiges
+    # Diktat zu langsam (20-30s statt 1-2s pro Satz).
+    first_size = MODEL_SIZE if DEVICE == "cuda" else CPU_MODEL_SIZE
+    candidates = [(DEVICE, COMPUTE_TYPE, first_size)]
     if DEVICE != "cpu":
         candidates.append(("cpu", "int8", CPU_MODEL_SIZE))
     last_err = None
@@ -2244,8 +2257,11 @@ def load_model() -> WhisperModel:
     raise RuntimeError(f"kein Modell ladbar: {last_err}")
 
 def _transcribe_with(m: WhisperModel, wav_path: str) -> str:
+    # Auf GPU ist Luft fuer einen breiteren Beam (bessere Wortwahl bei schwierigen
+    # Passagen, ~40% langsamer, bei 0.15x Realtime egal); auf CPU bleibt 5.
+    beam = 8 if ACTIVE.get("device") == "cuda" else 5
     segments, _ = m.transcribe(
-        wav_path, language=LANGUAGE, vad_filter=False, beam_size=5,
+        wav_path, language=LANGUAGE, vad_filter=False, beam_size=beam,
         no_speech_threshold=0.6, condition_on_previous_text=False,
         initial_prompt=GERMAN_PROMPT,
         # Temperatur-Fallback (Whisper-Standard): scheitert ein Decode, wird mit
@@ -2369,6 +2385,13 @@ def handle_toggle() -> None:
         samples = np.concatenate(chunks, axis=0).flatten()
         if samples.size < SAMPLE_RATE // 4:
             log.info("audio < 0.25s — silent skip"); overlay_set("idle"); return
+        # Auto-Gain: sehr leise Aufnahmen (leises Sprechen, Mikro weit weg) anheben —
+        # Whisper wird bei niedrigem Pegel merklich unsicherer. Peak landet im Log,
+        # damit Mikro-Probleme diagnostizierbar sind.
+        peak = float(np.max(np.abs(samples)))
+        if 0.0 < peak < 0.30:
+            samples = (samples * (0.85 / peak)).astype(np.float32)
+            log.info(f"audio peak {peak:.2f} -> auto-gain auf 0.85")
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name

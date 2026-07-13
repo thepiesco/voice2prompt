@@ -2,6 +2,30 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-07-13 (2) – Erkennungsqualität: echte Fehler aus 1555 Diktaten ausgewertet
+
+Alle bisherigen Diktate aus den Logs analysiert und die tatsächlich
+vorkommenden Fehler gezielt behoben:
+
+- **Doppel-Satzzeichen weg (48 Fälle).** Whisper produzierte an Satzgrenzen
+  Artefakte wie „das,, connect ich" oder „hab., das" – werden jetzt automatisch
+  zu einem sauberen Zeichen zusammengezogen.
+- **„einloggen"-Verhörer (4 Fälle).** „ausgelockt/eingelockt/lock mich ein"
+  wird jetzt automatisch zu „ausgeloggt/eingeloggt/logg mich ein" korrigiert.
+  Auch „Dark Meta" → „Dark Matter" (Buchtitel).
+- **Leise Aufnahmen werden angehoben.** Spricht man leise oder ist das Mikro
+  weit weg, wird der Pegel vor der Erkennung automatisch verstärkt – Whisper
+  versteht leise Aufnahmen sonst deutlich schlechter.
+- **Breiterer Suchstrahl auf der GPU.** Die Erkennung prüft pro Wort mehr
+  Kandidaten (beam 8 statt 5) – bessere Wortwahl bei schwierigen Passagen,
+  auf der GPU ohne spürbaren Zeitverlust.
+- **Bugfix:** Startet die App im CPU-Modus (GPU voll), lädt sie jetzt korrekt
+  das mittlere Modell statt des großen – das große wäre auf dem Prozessor mit
+  20-30 Sekunden pro Satz unbenutzbar träge gewesen.
+
+Eigene Verhörer nachpflegen: einfach in `vocab.json` den falsch gehörten
+Klang als Alias eintragen – die Datei bleibt privat (nicht im Repo).
+
 ## 2026-07-13 – Nie wieder minutenlanges Hängen, wenn die Grafikkarte voll ist
 
 Der AIbersetzer wurde plötzlich extrem langsam (bis über 2 Minuten für einen
