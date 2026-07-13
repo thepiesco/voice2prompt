@@ -85,9 +85,11 @@ pro Diktat, danach ~0,2 ct/Minute:
 notepad groq.key     # gsk_... Key reinpasten, speichern
 ```
 
-Kette: **GPU (lokal, gratis) → Groq-Cloud → CPU (offline-Backstop)**. Ohne
-`groq.key` wird die Cloud einfach übersprungen. Hinweis: Im Cloud-Modus geht
-das Diktat-Audio an Groq-Server (US).
+Kette: **GPU (lokal, gratis) → Groq-Cloud → CPU + Haiku-Korrektur → CPU roh**.
+Ohne `groq.key` wird die Cloud übersprungen; liegt ein `api.key` (Anthropic)
+da, korrigiert Claude Haiku im CPU-Modus Verhörer per Satzkontext (~0,1 ct,
+nur der erkannte Text geht zur API — das Audio bleibt immer lokal). Hinweis:
+Im Groq-Modus geht das Diktat-Audio an Groq-Server (US).
 
 ## Tipps
 

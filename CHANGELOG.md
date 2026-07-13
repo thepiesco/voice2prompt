@@ -2,6 +2,22 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-07-13 (4) – KI-Korrektur im Notfallmodus (nutzt den vorhandenen Anthropic-Key)
+
+Wer kein Groq-Konto anlegen will, bekommt jetzt trotzdem bessere Qualität,
+wenn die Grafikkarte blockiert ist: Das CPU-Modell transkribiert, und
+anschließend korrigiert Claude Haiku (über den bereits vorhandenen
+`api.key`) offensichtliche Verhörer per Satzkontext — aus „ich bin im
+browser eingelockt und die pisco rechnung ans finanz amt" wird „Ich bin im
+Browser eingeloggt und die PIESCO-Rechnung ans Finanzamt". Es wird NUR
+korrigiert, nie umformuliert; Umgangssprache bleibt erhalten.
+
+Kostet ~0,1 Cent pro Diktat und läuft ausschließlich im Notfallmodus — im
+GPU-Normalbetrieb weiterhin null API-Kosten. Reihenfolge der Stufen:
+**GPU (lokal) → Groq-Cloud (falls Key da) → CPU + Haiku-Korrektur → CPU roh**
+(ohne Internet/Keys). Wichtig: Audio bleibt dabei immer lokal — nur der
+erkannte TEXT geht zur Korrektur an die Anthropic-API.
+
 ## 2026-07-13 (3) – Cloud-Fallback: volle Qualität auch bei blockierter Grafikkarte
 
 Bisher galt: GPU voll → Wechsel aufs mittlere CPU-Modell (etwas ungenauer,
