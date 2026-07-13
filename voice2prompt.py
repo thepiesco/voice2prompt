@@ -2285,15 +2285,92 @@ def _cpu_fallback_model() -> WhisperModel:
             log.info(f"CPU-Notfallmodell bereit: {CPU_MODEL_SIZE} (int8)")
         return _cpu_fb["m"]
 
+# ---------- Cloud-STT (Groq, optional) ----------
+# Fallback-Kette: GPU (lokal, gratis) -> Cloud (Groq whisper-large-v3, gleiche
+# Qualitaet, ~0.2 ct/Min) -> CPU-medium (offline-Backstop). Cloud greift NUR wenn
+# die GPU blockiert ist (VRAM-Kontention) — im Normalbetrieb bleibt alles lokal.
+# Key-Datei: groq.key im Tool-Ordner (gitignored) oder env GROQ_API_KEY.
+# Achtung Datenschutz: im Cloud-Modus geht das Diktat-Audio an Groq (US-Server).
+CLOUD_STT_URL   = os.environ.get("V2P_CLOUD_STT_URL",
+                                 "https://api.groq.com/openai/v1/audio/transcriptions")
+CLOUD_STT_MODEL = os.environ.get("V2P_CLOUD_STT_MODEL", "whisper-large-v3")
+CLOUD_KEY_PATH  = os.path.join(HERE, "groq.key")
+_cloud = {"key": None, "checked": False}
+
+def _cloud_key():
+    if not _cloud["checked"]:
+        _cloud["checked"] = True
+        if os.environ.get("V2P_CLOUD_STT", "1") != "0":
+            k = os.environ.get("GROQ_API_KEY", "").strip()
+            if not k and os.path.exists(CLOUD_KEY_PATH):
+                try:
+                    with open(CLOUD_KEY_PATH, encoding="utf-8") as f:
+                        k = next((ln.strip() for ln in f
+                                  if ln.strip() and not ln.startswith("#")), "")
+                except Exception as e:
+                    log.warning(f"groq.key nicht lesbar: {e}")
+            _cloud["key"] = k or None
+        log.info(f"cloud STT: {'bereit (' + CLOUD_STT_MODEL + ')' if _cloud['key'] else 'kein Key — nur lokal'}")
+    return _cloud["key"]
+
+def _cloud_transcribe(wav_path: str):
+    """Transkription via Groq-API (OpenAI-kompatibel). None bei jedem Fehler —
+    der Aufrufer faellt dann auf das lokale CPU-Modell zurueck."""
+    key = _cloud_key()
+    if not key:
+        return None
+    try:
+        import httpx   # kommt als Dependency der anthropic-Lib mit
+        overlay_set("tx", "Cloud-Erkennung …")
+        t0 = time.time()
+        with open(wav_path, "rb") as f:
+            r = httpx.post(
+                CLOUD_STT_URL,
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": ("audio.wav", f, "audio/wav")},
+                data={"model": CLOUD_STT_MODEL, "language": LANGUAGE,
+                      "temperature": "0", "response_format": "json",
+                      # gleicher Eigennamen-Bias wie lokal (PIESCO, SOLA, KNX, …)
+                      "prompt": GERMAN_PROMPT[:800]},
+                timeout=20.0,
+            )
+        r.raise_for_status()
+        text = (r.json().get("text") or "").strip()
+        log.info(f"cloud transcribed {time.time() - t0:.1f}s -> {len(text)} chars")
+        return apply_vocab(text) if text else None
+    except Exception as e:
+        log.warning(f"cloud STT fehlgeschlagen ({e}) — lokaler Fallback")
+        return None
+
+# Degraded-Modus: GPU hat einmal gehaengt -> bis zum Neustart Cloud/CPU zuerst.
+_degraded = {"on": False}
+
+def _local_degraded_transcribe(wav_path: str) -> str:
+    fb = _cpu_fallback_model()
+    # Das alte GPU-Modell haelt nur noch der ggf. haengende Thread — danach GC,
+    # das gibt auch das VRAM fuer den anderen Prozess frei.
+    model_ref["m"] = fb
+    ACTIVE.update(device="cpu", size=CPU_MODEL_SIZE)
+    overlay_set("tx", "CPU-Modus …")
+    return _transcribe_with(fb, wav_path)
+
 def transcribe(wav_path: str, duration_sec: float = 0.0) -> str:
-    m = model_ref["m"]
-    if ACTIVE.get("device") != "cuda":
-        return _transcribe_with(m, wav_path)
+    gpu_ok = ACTIVE.get("device") == "cuda" and not _degraded["on"]
+    if not gpu_ok:
+        # CPU-Start (VRAM war beim Start knapp) oder degraded: Cloud liefert
+        # large-v3-Qualitaet in ~1-2s, lokal CPU-medium bleibt Offline-Backstop.
+        cloud = _cloud_transcribe(wav_path)
+        if cloud is not None:
+            return cloud
+        if ACTIVE.get("device") == "cuda":   # degraded, GPU-Modell noch aktiv
+            return _local_degraded_transcribe(wav_path)
+        return _transcribe_with(model_ref["m"], wav_path)
 
     # GPU-Pfad mit Watchdog: Andere Prozesse (TTS, Spiele, Streaming) koennen das
     # VRAM NACH dem Model-Load auffressen -> WDDM pagt ins RAM, die Transkription
     # kriecht (beobachtet: 21s fuer 1.5s Audio) oder haengt scheinbar endlos.
     # Normal laeuft large-v3 hier mit ~0.15x Realtime; 1.5x Realtime = 10x Puffer.
+    m = model_ref["m"]
     timeout = max(20.0, duration_sec * 1.5)
     box = {}
     def work():
@@ -2305,17 +2382,17 @@ def transcribe(wav_path: str, duration_sec: float = 0.0) -> str:
     th.start()
     th.join(timeout)
     if th.is_alive():
+        has_cloud = _cloud_key() is not None
         log.warning(f"GPU-Transkription haengt (> {timeout:.0f}s, vermutlich VRAM von "
-                    f"anderem Prozess belegt) — wechsle dauerhaft auf CPU")
+                    f"anderem Prozess belegt) — ab jetzt {'Cloud' if has_cloud else 'CPU'} "
+                    f"(bis zum Neustart; der prueft VRAM neu)")
+        set_tray("tx", "GPU voll – Fallback")
+        _degraded["on"] = True
+        cloud = _cloud_transcribe(wav_path)
+        if cloud is not None:
+            return cloud
         overlay_set("tx", "GPU voll – wechsle auf CPU …")
-        set_tray("tx", "GPU voll – CPU-Modus")
-        fb = _cpu_fallback_model()
-        # Sticky: ab jetzt direkt CPU (bis zum Neustart; der prueft VRAM neu).
-        # Das alte GPU-Modell haelt nur noch der haengende Thread — danach GC,
-        # das gibt auch das VRAM fuer den anderen Prozess frei.
-        model_ref["m"] = fb
-        ACTIVE.update(device="cpu", size=CPU_MODEL_SIZE)
-        return _transcribe_with(fb, wav_path)
+        return _local_degraded_transcribe(wav_path)
     if "err" in box:
         raise box["err"]
     return box["text"]

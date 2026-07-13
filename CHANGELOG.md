@@ -2,6 +2,23 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-07-13 (3) – Cloud-Fallback: volle Qualität auch bei blockierter Grafikkarte
+
+Bisher galt: GPU voll → Wechsel aufs mittlere CPU-Modell (etwas ungenauer,
+langsamer). Neu gibt es eine dritte Stufe dazwischen: Liegt ein Groq-API-Key
+in `groq.key`, springt bei blockierter GPU automatisch die Groq-Cloud ein —
+dort läuft exakt dasselbe große Whisper-Modell wie lokal, Antwort in 1-2
+Sekunden, Kosten ~0,2 Cent pro Diktat-Minute (großzügiges Gratis-Kontingent).
+
+Die Kette: **GPU (lokal, gratis) → Cloud (gleiche Qualität, Mini-Kosten) →
+CPU (offline-Backstop, gratis)**. Im Normalbetrieb ändert sich nichts — die
+Cloud wird nur benutzt, wenn die GPU tatsächlich klemmt. Ohne Key verhält
+sich alles wie bisher. Wichtig zu wissen: Im Cloud-Modus wird das
+Diktat-Audio an Groq-Server (USA) geschickt.
+
+Warum nicht über den vorhandenen Anthropic-Key? Die Claude-API kann keine
+Audio-Dateien verarbeiten — Transkription braucht einen Whisper-Anbieter.
+
 ## 2026-07-13 (2) – Erkennungsqualität: echte Fehler aus 1555 Diktaten ausgewertet
 
 Alle bisherigen Diktate aus den Logs analysiert und die tatsächlich

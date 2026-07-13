@@ -1,4 +1,5 @@
 api.key
+groq.key
 voice2prompt.log
 voice2prompt.log.*
 vocab.json

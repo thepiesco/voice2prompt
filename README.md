@@ -72,6 +72,23 @@ meinem eigenen Anthropic-Key ersetzen — Key holen unter
 console.anthropic.com/settings/keys), dann start.cmd starten.
 ```
 
+## Cloud-Fallback (optional)
+
+Läuft normalerweise komplett lokal auf der GPU. Ist die GPU von einem anderen
+Programm blockiert (KI-Bildgenerierung, TTS, Spiele), wird die Erkennung sonst
+quälend langsam. Mit einem [Groq](https://console.groq.com)-API-Key (kostenlose
+Registrierung, großzügiges Gratis-Kontingent) springt in dem Fall automatisch
+die Groq-Cloud ein — gleiches whisper-large-v3-Modell, gleiche Qualität, ~1-2 s
+pro Diktat, danach ~0,2 ct/Minute:
+
+```bash
+notepad groq.key     # gsk_... Key reinpasten, speichern
+```
+
+Kette: **GPU (lokal, gratis) → Groq-Cloud → CPU (offline-Backstop)**. Ohne
+`groq.key` wird die Cloud einfach übersprungen. Hinweis: Im Cloud-Modus geht
+das Diktat-Audio an Groq-Server (US).
+
 ## Tipps
 
 - **Cursor erst ins Zielfenster, dann Strg+Leertaste.** Tool paste'd via Strg+V
