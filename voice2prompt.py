@@ -15,6 +15,7 @@ APP_NAME = "AIbersetzer"
 import os
 import re
 import sys
+import subprocess
 import time
 import json
 import queue
@@ -22,6 +23,7 @@ import threading
 import tempfile
 import wave
 import logging
+import difflib
 from logging.handlers import RotatingFileHandler
 import ctypes
 from ctypes import wintypes
@@ -34,6 +36,40 @@ import pyperclip
 import webview
 from PIL import Image, ImageDraw
 import pystray
+
+# ---------- CUDA-DLLs (GPU-Beschleunigung) ----------
+# faster-whisper/CTranslate2 braucht cuBLAS + cuDNN als DLLs. Statt das volle
+# CUDA-Toolkit global zu installieren, liefern die pip-Pakete nvidia-cublas-cu12
+# und nvidia-cudnn-cu12 genau diese DLLs mit — wir haengen ihre bin-Ordner in den
+# DLL-Suchpfad, BEVOR ctranslate2 (via faster_whisper) geladen wird. Fehlt was
+# oder ist keine GPU da -> stiller CPU-Fallback in load_model().
+def _register_cuda_dlls() -> None:
+    if not hasattr(os, "add_dll_directory"):
+        return
+    try:
+        import importlib.util
+        dirs = []
+        # cuda_runtime (cudart) zuerst — cublas/cudnn haengen davon ab.
+        for pkg in ("nvidia.cuda_runtime", "nvidia.cublas", "nvidia.cudnn"):
+            spec = importlib.util.find_spec(pkg)
+            locs = getattr(spec, "submodule_search_locations", None) if spec else None
+            if not locs:
+                continue
+            bindir = os.path.join(list(locs)[0], "bin")
+            if os.path.isdir(bindir):
+                os.add_dll_directory(bindir)
+                dirs.append(bindir)
+        # WICHTIG: ctranslate2 laedt cublas64_12.dll dynamisch per LoadLibrary —
+        # das durchsucht PATH, aber NICHT die add_dll_directory-Liste. Ohne den
+        # PATH-Eintrag schlaegt die GPU-Inferenz mit "cublas64_12.dll not found"
+        # fehl, obwohl die DLL da ist. Also beides setzen.
+        if dirs:
+            os.environ["PATH"] = os.pathsep.join(dirs) + os.pathsep + os.environ.get("PATH", "")
+    except Exception:
+        pass  # GPU optional — bei Fehler greift der CPU-Fallback
+
+_register_cuda_dlls()
+
 from faster_whisper import WhisperModel
 try:
     import anthropic
@@ -41,9 +77,51 @@ except ImportError:
     anthropic = None
 
 # ---------- Konfig ----------
-MODEL_SIZE   = os.environ.get("V2P_MODEL", "small")
-COMPUTE_TYPE = os.environ.get("V2P_COMPUTE", "int8")
-LANGUAGE     = os.environ.get("V2P_LANG", "de")
+# Modell-Groesse = groesster Hebel fuer DE-Genauigkeit. large-v3 macht bei Deutsch
+# (Umlaute, Komposita, Fachbegriffe, Eigennamen) DEUTLICH weniger Fehler als small.
+# Auf der RTX 3060 Ti laeuft es per GPU schneller als small auf CPU.
+MODEL_SIZE     = os.environ.get("V2P_MODEL", "large-v3")
+# Auf CPU ist large-v3 zu langsam fuer fluessiges Diktat -> dort kleineres Modell.
+CPU_MODEL_SIZE = os.environ.get("V2P_CPU_MODEL", "medium")
+LANGUAGE       = os.environ.get("V2P_LANG", "de")
+
+# large-v3 float16 braucht real ~4-4.5 GB VRAM (Gewichte + Beam-5-Workspace).
+# Ist weniger frei (TTS, Spiele, Streaming laufen parallel), pagt Windows/WDDM
+# GPU-Speicher ins RAM und die Transkription wird 10-100x langsamer statt zu crashen.
+MIN_VRAM_MB = int(os.environ.get("V2P_MIN_VRAM_MB", "4500"))
+
+def _vram_free_mb():
+    """Freies VRAM in MB via nvidia-smi; None wenn nicht ermittelbar."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=0x08000000)  # CREATE_NO_WINDOW — kein Konsolen-Blitz unter pythonw
+        return int(r.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
+
+def _detect_device():
+    """GPU automatisch nutzen wenn vorhanden (float16) UND genug VRAM frei, sonst CPU (int8).
+    Achtung: get_cuda_device_count()>0 heisst NICHT, dass die CUDA-DLLs laden —
+    den echten Beweis liefert erst der Smoke-Test in load_model()."""
+    dev = os.environ.get("V2P_DEVICE")
+    if dev:
+        return dev, os.environ.get("V2P_COMPUTE", "float16" if dev == "cuda" else "int8")
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            free = _vram_free_mb()
+            if free is not None and free < MIN_VRAM_MB:
+                log.warning(f"GPU vorhanden, aber nur {free} MB VRAM frei (< {MIN_VRAM_MB}) "
+                            f"— starte auf CPU ({CPU_MODEL_SIZE}, int8)")
+                return "cpu", os.environ.get("V2P_COMPUTE", "int8")
+            return "cuda", os.environ.get("V2P_COMPUTE", "float16")
+    except Exception:
+        pass
+    return "cpu", os.environ.get("V2P_COMPUTE", "int8")
+# GERMAN_PROMPT + Vokabel-Korrektur werden weiter unten aus vocab.json gebaut
+# (siehe Abschnitt "Eigennamen-/Vokabular-Korrektur").
 SAMPLE_RATE  = 16000
 CHANNELS     = 1
 BLOCKSIZE    = 1600          # 100 ms @ 16 kHz — prompte, gleichmaessige Callbacks
@@ -60,6 +138,9 @@ _handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=2, enco
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logging.basicConfig(level=logging.INFO, handlers=[_handler])
 log = logging.getLogger("v2p")
+
+# Erst NACH dem Logging-Setup aufrufen — _detect_device loggt den VRAM-Check.
+DEVICE, COMPUTE_TYPE = _detect_device()
 
 # ---------- Settings (Modus ueberlebt Neustart) ----------
 def load_settings() -> dict:
@@ -2038,20 +2119,190 @@ def set_tray(state: str, tooltip: str) -> None:
         except Exception as e:
             log.debug(f"set_tray failed: {e}")
 
-# ---------- Whisper ----------
-def load_model() -> WhisperModel:
-    log.info(f"loading model {MODEL_SIZE} ({COMPUTE_TYPE})")
-    m = WhisperModel(MODEL_SIZE, device="cpu", compute_type=COMPUTE_TYPE)
-    log.info("model ready")
-    return m
+# ---------- Eigennamen-/Vokabular-Korrektur ----------
+# PIESCO, SOLA, KNX & Co. sind Kunstwoerter — Whisper verhoert sie phonetisch
+# ("Piesko", "Zola", "Knicks", "Cloudcode"). Der initial_prompt biast nur, garantiert
+# aber nichts. Zuverlaessig wird's erst durch eine deterministische Nachkorrektur:
+# bekannte Verhoerer -> kanonische Schreibweise. Liste liegt in vocab.json und ist
+# vom Nutzer leicht erweiterbar (einfach beobachtete Falsch-Schreibung als Alias
+# eintragen). "fuzzy": true faengt zusaetzlich UNGESEHENE Varianten markanter
+# Begriffe ab (hohe Aehnlichkeitsschwelle -> kaum Fehlkorrekturen). Kurze/normale
+# Woerter (SOLA, KNX) bleiben alias-only, damit z.B. "Solar" nicht zu "SOLA" wird.
+VOCAB_PATH = os.path.join(HERE, "vocab.json")
+_DEFAULT_VOCAB = [
+    {"canonical": "PIESCO", "fuzzy": True,
+     "aliases": ["piesko", "pisco", "biesco", "biesko", "piasco", "pesko", "pesco",
+                 "pietzko", "piesgo", "piscoe", "pisko", "piesco", "bisco", "piescho"]},
+    {"canonical": "SOLA", "fuzzy": False,
+     "aliases": ["zola", "soler", "sohla", "sohler", "solla", "zohla", "sahla", "sola"]},
+    {"canonical": "KNX", "fuzzy": False,
+     "aliases": ["knicks", "knx", "kanax", "ka en iks", "ka n x", "k n x",
+                 "k. n. x.", "kn x", "kennix", "kaenix"]},
+    {"canonical": "Cloudflare", "fuzzy": True,
+     "aliases": ["cloud flare", "cloudflair", "cloudflyer", "cloudfler",
+                 "klaudflare", "cloud fair", "cloudflare"]},
+    {"canonical": "Claude Code", "fuzzy": False,
+     "aliases": ["cloudcode", "cloud code", "klaut code", "claud code", "clot code",
+                 "klode code", "claude-code", "cloutcode", "cloud-code", "clode code"]},
+    {"canonical": "Claude", "fuzzy": False,
+     "aliases": ["cloud ai", "klaut ki", "claude ai"]},
+    {"canonical": "GitHub", "fuzzy": False,
+     "aliases": ["github", "git hub", "git-hub", "gitup", "githab"]},
+]
 
-def transcribe(wav_path: str) -> str:
-    m = model_ref["m"]
+def load_vocab() -> list:
+    try:
+        if os.path.exists(VOCAB_PATH):
+            with open(VOCAB_PATH, encoding="utf-8") as f:
+                terms = (json.load(f) or {}).get("terms")
+            if terms:
+                return terms
+    except Exception as e:
+        log.warning(f"vocab read failed: {e}")
+    # beim ersten Start Default-Datei schreiben -> Nutzer kann Begriffe ergaenzen
+    try:
+        with open(VOCAB_PATH, "w", encoding="utf-8") as f:
+            json.dump({"_hinweis": "Eigene Begriffe hier ergaenzen. 'aliases' = wie "
+                       "Whisper sie falsch versteht (klein); 'fuzzy' faengt auch "
+                       "aehnliche, ungesehene Varianten (nur fuer markante, lange "
+                       "Begriffe sinnvoll).",
+                       "terms": _DEFAULT_VOCAB}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"vocab write failed: {e}")
+    return _DEFAULT_VOCAB
+
+VOCAB = load_vocab()
+FUZZY_THRESHOLD = 0.82
+
+def _compile_vocab(terms):
+    alias_rules, fuzzy_terms = [], []
+    for t in terms:
+        canon = (t.get("canonical") or "").strip()
+        if not canon:
+            continue
+        # kanonische Form selbst als Alias -> normalisiert auch nur falsche Gross-/
+        # Kleinschreibung (z.B. "Piesco"/"piesco" -> "PIESCO").
+        aliases = {a.strip() for a in (t.get("aliases") or []) if a.strip()} | {canon}
+        # laengste zuerst -> Mehrwort-Aliase ("cloud code") vor Einzelwoertern
+        for a in sorted(aliases, key=len, reverse=True):
+            pat = r"\b" + r"\s+".join(re.escape(p) for p in a.split()) + r"\b"
+            alias_rules.append((re.compile(pat, re.IGNORECASE), canon))
+        if t.get("fuzzy"):
+            fuzzy_terms.append(canon)
+    return alias_rules, fuzzy_terms
+
+ALIAS_RULES, FUZZY_TERMS = _compile_vocab(VOCAB)
+
+def apply_vocab(text: str) -> str:
+    """Verhoerte Eigennamen -> kanonische Schreibweise. Idempotent."""
+    if not text:
+        return text
+    for rx, canon in ALIAS_RULES:        # 1) bekannte Aliase (inkl. Mehrwort)
+        text = rx.sub(canon, text)
+    if FUZZY_TERMS:                       # 2) Fuzzy-Fang fuer markante Begriffe
+        def fix(m):
+            tok = m.group(0); low = tok.lower()
+            best, score = None, 0.0
+            for canon in FUZZY_TERMS:
+                r = difflib.SequenceMatcher(None, low, canon.lower()).ratio()
+                if r > score:
+                    best, score = canon, r
+            return best if (best and score >= FUZZY_THRESHOLD and low != best.lower()) else tok
+        text = re.sub(r"\b\w{5,}\b", fix, text)
+    return text
+
+# initial_prompt biast Whisper schon WAEHREND der Erkennung auf DE-Orthografie +
+# die Eigennamen aus vocab.json (Doppel-Absicherung mit apply_vocab danach).
+GERMAN_PROMPT = os.environ.get("V2P_PROMPT") or (
+    "Diktat auf Deutsch in korrekter Rechtschreibung mit Umlauten (ä, ö, ü) und ß. "
+    "Wiederkehrende Eigennamen und Begriffe: "
+    + ", ".join(t.get("canonical", "") for t in VOCAB if t.get("canonical")) + ".")
+
+# ---------- Whisper ----------
+ACTIVE = {"device": "?", "size": "?"}   # was tatsaechlich laeuft (fuers Log)
+
+def load_model() -> WhisperModel:
+    # Kandidaten in Reihenfolge: zuerst die erkannte (GPU), dann CPU-Fallback mit
+    # kleinerem Modell. Pro Kandidat ein Smoke-Test (0.1 s Stille) — der deckt
+    # fehlende CUDA-DLLs SOFORT auf, statt erst beim ersten echten Diktat zu crashen.
+    candidates = [(DEVICE, COMPUTE_TYPE, MODEL_SIZE)]
+    if DEVICE != "cpu":
+        candidates.append(("cpu", "int8", CPU_MODEL_SIZE))
+    last_err = None
+    for device, compute, size in candidates:
+        try:
+            log.info(f"loading model {size} on {device} ({compute})")
+            m = WhisperModel(size, device=device, compute_type=compute)
+            list(m.transcribe(np.zeros(SAMPLE_RATE // 10, dtype=np.float32),
+                              language=LANGUAGE)[0])   # Smoke-Test (Generator leeren)
+            log.info(f"model ready: {size} on {device} ({compute})")
+            ACTIVE.update(device=device, size=size)
+            return m
+        except Exception as e:
+            last_err = e
+            log.warning(f"model {size} on {device} failed: {e}")
+    raise RuntimeError(f"kein Modell ladbar: {last_err}")
+
+def _transcribe_with(m: WhisperModel, wav_path: str) -> str:
     segments, _ = m.transcribe(
         wav_path, language=LANGUAGE, vad_filter=False, beam_size=5,
         no_speech_threshold=0.6, condition_on_previous_text=False,
+        initial_prompt=GERMAN_PROMPT,
+        # Temperatur-Fallback (Whisper-Standard): scheitert ein Decode, wird mit
+        # hoeherer Temperatur neu versucht statt Schrott auszugeben.
+        temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        compression_ratio_threshold=2.4,   # faengt halluzinierte Wort-Wiederholungen ab
+        log_prob_threshold=-1.0,           # verwirft zu unsichere Segmente
     )
-    return " ".join(s.text.strip() for s in segments if s.text and s.text.strip())
+    raw = " ".join(s.text.strip() for s in segments if s.text and s.text.strip())
+    return apply_vocab(raw)   # verhoerte Eigennamen -> kanonisch (PIESCO, SOLA, KNX, …)
+
+# CPU-Notfallmodell: wird erst geladen wenn die GPU-Transkription haengt (lazy).
+_cpu_fb_lock = threading.Lock()
+_cpu_fb = {"m": None}
+
+def _cpu_fallback_model() -> WhisperModel:
+    with _cpu_fb_lock:
+        if _cpu_fb["m"] is None:
+            log.warning(f"lade CPU-Notfallmodell {CPU_MODEL_SIZE} (int8) …")
+            _cpu_fb["m"] = WhisperModel(CPU_MODEL_SIZE, device="cpu", compute_type="int8")
+            log.info(f"CPU-Notfallmodell bereit: {CPU_MODEL_SIZE} (int8)")
+        return _cpu_fb["m"]
+
+def transcribe(wav_path: str, duration_sec: float = 0.0) -> str:
+    m = model_ref["m"]
+    if ACTIVE.get("device") != "cuda":
+        return _transcribe_with(m, wav_path)
+
+    # GPU-Pfad mit Watchdog: Andere Prozesse (TTS, Spiele, Streaming) koennen das
+    # VRAM NACH dem Model-Load auffressen -> WDDM pagt ins RAM, die Transkription
+    # kriecht (beobachtet: 21s fuer 1.5s Audio) oder haengt scheinbar endlos.
+    # Normal laeuft large-v3 hier mit ~0.15x Realtime; 1.5x Realtime = 10x Puffer.
+    timeout = max(20.0, duration_sec * 1.5)
+    box = {}
+    def work():
+        try:
+            box["text"] = _transcribe_with(m, wav_path)
+        except Exception as e:
+            box["err"] = e
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        log.warning(f"GPU-Transkription haengt (> {timeout:.0f}s, vermutlich VRAM von "
+                    f"anderem Prozess belegt) — wechsle dauerhaft auf CPU")
+        overlay_set("tx", "GPU voll – wechsle auf CPU …")
+        set_tray("tx", "GPU voll – CPU-Modus")
+        fb = _cpu_fallback_model()
+        # Sticky: ab jetzt direkt CPU (bis zum Neustart; der prueft VRAM neu).
+        # Das alte GPU-Modell haelt nur noch der haengende Thread — danach GC,
+        # das gibt auch das VRAM fuer den anderen Prozess frei.
+        model_ref["m"] = fb
+        ACTIVE.update(device="cpu", size=CPU_MODEL_SIZE)
+        return _transcribe_with(fb, wav_path)
+    if "err" in box:
+        raise box["err"]
+    return box["text"]
 
 # ---------- Aufnahme-Logik ----------
 def paste_clipboard(prev_clip: str = None) -> None:
@@ -2123,7 +2374,7 @@ def handle_toggle() -> None:
             wav_path = f.name
         write_wav(samples, wav_path)
         t0 = time.time()
-        raw = transcribe(wav_path)
+        raw = transcribe(wav_path, samples.size / SAMPLE_RATE)
         dt = time.time() - t0
         clean = light_cleanup(raw)
         log.info(f"transcribed {dt:.1f}s -> {len(clean)} chars: {clean[:120]!r}")
@@ -2132,7 +2383,7 @@ def handle_toggle() -> None:
 
         if api_key_ref["k"] and polish_mode != "off":
             overlay_set("tx", f"{MODE_SHORT.get(polish_mode, polish_mode)}-Polish …")
-            final = polish(clean, polish_mode)
+            final = apply_vocab(polish(clean, polish_mode))   # Polish koennte Namen neu verdrehen
         else:
             final = clean
 
@@ -2219,17 +2470,44 @@ def run_tray() -> None:
     icon.run()
 
 # ---------- Audio-Stream im eigenen Thread (mit Auto-Restart) ----------
+def _pick_input_device():
+    """Gueltiges Eingabegeraet bestimmen. PortAudio liefert -1 (paNoDevice),
+    wenn beim Init kein Default-Mikro da war — dann erstes echtes Input-Geraet."""
+    try:
+        dev = sd.default.device[0]
+    except Exception:
+        dev = -1
+    if isinstance(dev, int) and dev >= 0:
+        return None  # Default ist gueltig -> sounddevice selbst entscheiden lassen
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_input_channels", 0) > 0:
+                log.info(f"kein Default-Mikro — nutze Geraet {i} ({d['name']!r})")
+                return i
+    except Exception as e:
+        log.warning(f"device scan failed: {e}")
+    return None
+
 def audio_runner() -> None:
     while not stop_signal:
         try:
+            dev = _pick_input_device()
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
                                 dtype="float32", blocksize=BLOCKSIZE,
-                                latency="low", callback=audio_callback):
+                                latency="low", device=dev, callback=audio_callback):
                 log.info("audio stream open")
                 while not stop_signal:
                     time.sleep(0.1)
         except Exception as e:
             log.warning(f"audio stream error: {e} — restart in 1.5s")
+            # PortAudio cached die Geraeteliste beim Init. Startete die App ohne
+            # aktives Mikro, bleibt der Default -1 fuer immer. Neu initialisieren,
+            # damit ein spaeter aktiviertes/eingestecktes Mikro erkannt wird.
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception as re:
+                log.warning(f"portaudio reinit failed: {re}")
             time.sleep(1.5)
 
 # ---------- main ----------

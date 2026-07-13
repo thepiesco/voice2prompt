@@ -1,5 +1,7 @@
 api.key
 voice2prompt.log
+voice2prompt.log.*
+vocab.json
 __pycache__/
 *.pyc
 _check.py

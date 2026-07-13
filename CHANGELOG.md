@@ -2,6 +2,60 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-07-13 – Nie wieder minutenlanges Hängen, wenn die Grafikkarte voll ist
+
+Der AIbersetzer wurde plötzlich extrem langsam (bis über 2 Minuten für einen
+kurzen Satz) und wirkte eingefroren. Ursache: Ein anderes Programm (die
+KI-Stimme aus einer parallelen Claude-Session) hat sich denselben
+Grafikkarten-Speicher genommen. Windows lagert dann GPU-Daten ins normale RAM
+aus – das stürzt nicht ab, sondern wird einfach 10- bis 100-mal langsamer.
+Zwei Schutzmechanismen eingebaut:
+
+- **Speicher-Check beim Start.** Sind beim Start weniger als 4,5 GB
+  Grafikspeicher frei (weil z. B. gerade eine KI-Stimme oder ein Spiel läuft),
+  startet der AIbersetzer direkt auf dem Prozessor mit dem mittleren Modell –
+  etwas ungenauer, aber flüssig statt eingefroren.
+- **Wachhund während des Betriebs.** Dauert eine Erkennung auf der GPU
+  auffällig lange (über 20 Sekunden bzw. das 1,5-fache der Aufnahmelänge),
+  wechselt die App automatisch mitten im Betrieb auf den Prozessor und bleibt
+  dort bis zum nächsten Start. Das Overlay zeigt dann „GPU voll – wechsle auf
+  CPU …". Kein Eingreifen nötig.
+
+Einstellbar per Umgebungsvariable: `V2P_MIN_VRAM_MB` (Standard 4500).
+
+## 2026-06-17 – Deutsch-Erkennung deutlich genauer (GPU + großes Modell)
+
+Es wurden zu viele Wörter falsch verstanden. Ursache: der AIbersetzer lief mit
+dem kleinsten Erkennungs-Modell auf dem Prozessor. Drei Hebel gezogen:
+
+- **Großes Modell statt kleinem.** Statt „small" läuft jetzt „large-v3" – das
+  beste verfügbare Whisper-Modell. Es macht bei Deutsch (Umlaute, lange
+  zusammengesetzte Wörter, Fachbegriffe, Namen) viel weniger Fehler.
+- **Grafikkarte statt Prozessor.** Das große Modell läuft jetzt auf der
+  RTX-3060-Ti-GPU – dadurch ist es trotz Größe **schneller** als vorher das
+  kleine Modell auf dem Prozessor. Klappt die GPU mal nicht (DLLs/Treiber),
+  fällt die App automatisch und still auf den Prozessor mit einem mittleren
+  Modell zurück – sie streikt also nie.
+- **Deutscher „Stichwort-Zettel".** Dem Erkenner wird vorab gesagt: Das wird
+  Deutsch mit Umlauten und ß, und es kommen Begriffe wie Claude Code, PIESCO,
+  KNX, SOLA, Cloudflare, GitHub usw. vor. Das zieht die Erkennung in die
+  richtige Richtung – weniger verhörte Eigennamen und Technik-Wörter.
+
+- **Eigennamen-Korrektur (PIESCO, SOLA, KNX, Claude Code …).** Das sind
+  Kunstwörter, die der Erkenner gern verhört („Piesko", „Zola", „Knicks",
+  „Cloudcode"). Neu gibt es eine feste Korrektur-Liste: bekannte Verhörer werden
+  nach der Erkennung automatisch auf die richtige Schreibweise gezogen – plus ein
+  „Ähnlichkeits-Fang", der auch nie gesehene Verdreher markanter Namen abfängt.
+  Normale Wörter wie „Solaranlage" oder „Fiasko" bleiben dabei unangetastet. Die
+  Liste steht in `vocab.json` und lässt sich jederzeit um eigene Begriffe
+  erweitern (einfach den falsch gehörten Klang als Alias eintragen).
+
+Zusätzlich werden unsichere Erkennungen jetzt verworfen statt geraten, und bei
+einem Fehlversuch wird automatisch nochmal sauberer dekodiert.
+
+Einmalig nötig (automatisch eingerichtet): die GPU-Bausteine cuBLAS + cuDNN als
+pip-Pakete und der einmalige Download des großen Modells (~3 GB).
+
 ## 2026-06-07 – Text größer + Overlay nie mehr unsichtbar
 
 - **Text besser lesbar.** Nach dem Verkleinern war die Schrift einen Ticken zu
