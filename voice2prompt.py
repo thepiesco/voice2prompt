@@ -318,15 +318,64 @@ def apply_region(hwnd: int, w: int, h: int) -> None:
 def _short_preview(text: str, n: int = 40) -> str:
     return text if len(text) <= n else text[:n - 1] + "…"
 
+# ---------- UI-Bruecke ----------
+# evaluate_js ist ein synchroner IPC-Roundtrip in den WebView2-Prozess, und dessen
+# Antwortzeit steigt mit der Laufzeit: gemessen am 14.08.2026 ueber zwei Logbuecher
+# (1400 Diktate) lag der Median in den ersten 8 h bei 0,01 s, nach 20 h bei 0,3 s,
+# nach 92 h bei 1,2 s — mit Spitzen bis 7 s. Solange die Aufrufer direkt evaluiert
+# haben, hing der Tastendruck daran: overlay_set("rec") lief VOR dem Setzen von
+# `recording`, die Aufnahme wartete also auf den WebView. Das war das "super langsam"
+# — die Transkription selbst lag durchgehend bei 1-2 s.
+# Jetzt stellen alle Aufrufer nur in die Queue, ein einziger Thread pusht.
+_ui_q: "queue.Queue[str]" = queue.Queue(maxsize=64)
+_ui_level = [None]          # Pegel wird ueberschrieben statt gestaut — nur der neueste zaehlt
+_ui_slow_logged = [0.0]
+_ui_started = [0.0]
+
 def _js_eval(code: str) -> None:
-    """Sicher JS im WebView ausfuehren — kein Crash wenn kein Window da."""
-    w = window_ref["w"]
-    if not w:
+    """UI-Update einreihen. Blockiert den Aufrufer nie."""
+    if not window_ref["w"]:
         return
     try:
-        w.evaluate_js(code)
-    except Exception as e:
-        log.debug(f"js_eval failed: {e}")
+        _ui_q.put_nowait(code)
+    except queue.Full:
+        log.debug("ui queue voll — Update verworfen")
+
+def ui_pusher() -> None:
+    """Einziger Thread, der evaluate_js aufruft.
+
+    Serialisiert die Calls und haelt Audio-, Hotkey- und Transkriptions-Thread frei.
+    Zustands-Updates haben Vorrang; der Mikro-Pegel wird nur gepusht, wenn sonst
+    nichts ansteht, und immer nur mit dem aktuellsten Wert.
+    """
+    _ui_started[0] = time.monotonic()
+    while not stop_signal:
+        try:
+            code = _ui_q.get(timeout=0.05)
+        except queue.Empty:
+            lvl = _ui_level[0]
+            if lvl is None:
+                continue
+            _ui_level[0] = None
+            code = f"window.v2p && window.v2p.setLevel({lvl:.3f})"
+        w = window_ref["w"]
+        if not w:
+            continue
+        t0 = time.monotonic()
+        try:
+            w.evaluate_js(code)
+        except Exception as e:
+            log.debug(f"js_eval failed: {e}")
+        dt = time.monotonic() - t0
+        # Der WebView bremst weiterhin mit der Laufzeit — nur merkt man es jetzt
+        # nirgends mehr. Ins Log gehoert es trotzdem, sonst sucht die naechste
+        # Fehlersuche wieder beim Mikrofon statt bei Edge.
+        # Die ersten Sekunden sind ausgenommen: da baut Edge den WebView erst auf,
+        # der allererste Call dauert regulaer 1-2 s und ist kein Alarm.
+        now = time.monotonic()
+        if dt > 1.0 and now - _ui_started[0] > 15 and now - _ui_slow_logged[0] > 60:
+            _ui_slow_logged[0] = now
+            log.warning(f"WebView2 braucht {dt:.1f}s pro UI-Update — Neustart empfohlen")
 
 def overlay_redraw() -> None:
     """Pusht den aktuellen overlay_state in die UI."""
@@ -353,8 +402,13 @@ def overlay_set_then_idle(state: str, msg: str, after_ms: int) -> None:
     threading.Thread(target=revert, daemon=True).start()
 
 def push_level(x: float) -> None:
-    """Mikrofon-Pegel (0..1) an die Waveform schicken. Aus dem Audio-Thread."""
-    _js_eval(f"window.v2p && window.v2p.setLevel({x:.3f})")
+    """Mikrofon-Pegel (0..1) fuer die Waveform hinterlegen. Aus dem Audio-Thread.
+
+    Nur ablegen, nicht senden: der PortAudio-Callback muss in wenigen Millisekunden
+    zurueck sein, sonst reisst die Aufnahme Loecher. Ein veralteter Pegel ist wertlos,
+    deshalb ueberschreiben statt anstellen.
+    """
+    _ui_level[0] = x
 
 # HTML/CSS/JS-UI — rendert in Edge WebView2.
 HTML_TEMPLATE = r"""<!doctype html>
@@ -876,7 +930,6 @@ def build_overlay():
     return win
 
 # ---------- Audio ----------
-_lvl_skip = [0]
 def audio_callback(indata, frames, t_, status) -> None:
     if status:
         log.debug(f"audio status: {status}")
@@ -886,13 +939,35 @@ def audio_callback(indata, frames, t_, status) -> None:
         prebuffer.append(block)
     if recording:
         audio_q.put(block)
-        # Mikrofon-Pegel an die Waveform (gedrosselt — jeder 1. Block reicht @10Hz)
+        # Mikrofon-Pegel an die Waveform — nur hinterlegen, der ui_pusher holt ihn ab
         try:
             rms = float(np.sqrt(np.mean(np.square(block))))
             lvl = min(1.0, (rms ** 0.7) * 4.2)   # leicht komprimiert -> auch leise Sprache schlaegt sichtbar aus
             push_level(lvl)
         except Exception:
             pass
+
+def highpass(samples: np.ndarray, f_stop: float = 60.0, f_pass: float = 120.0) -> np.ndarray:
+    """Entfernt Tieffrequenz-Stoerungen vor dem Auto-Gain.
+
+    Der analoge Klinken-Eingang faengt sich 50-Hz-Netzbrummen ein (gemessen 12.08.2026:
+    212x ueber der Nachbarschaft, 79 % der Rauschleistung unter 80 Hz). Ohne Filter
+    verstaerkt der Auto-Gain dieses Brummen 1:1 mit der Stimme — der Peak stammte
+    teilweise gar nicht vom Sprechen. Sprache traegt ihre Information in den Formanten
+    ab ~300 Hz (Telefonie: 300-3400 Hz), unter 120 Hz geht nichts Nutzbares verloren.
+
+    FFT-Filterung statt IIR: das komplette Audio liegt bereits im Speicher, damit ist
+    das exakt und ohne Python-Sample-Schleife.
+    """
+    n = samples.size
+    if n < 64:
+        return samples
+    freqs = np.fft.rfftfreq(n, 1.0 / SAMPLE_RATE)
+    gain = np.ones_like(freqs)
+    gain[freqs <= f_stop] = 0.0
+    ramp = (freqs > f_stop) & (freqs < f_pass)          # weiche Flanke, kein Ringing
+    gain[ramp] = 0.5 - 0.5 * np.cos(np.pi * (freqs[ramp] - f_stop) / (f_pass - f_stop))
+    return np.fft.irfft(np.fft.rfft(samples) * gain, n=n).astype(np.float32)
 
 def write_wav(samples: np.ndarray, path: str) -> None:
     samples = np.clip(samples, -1.0, 1.0)
@@ -2480,11 +2555,14 @@ def handle_toggle() -> None:
                 except queue.Empty: break
             with prebuffer_lock:
                 preroll_snap[:] = list(prebuffer)
+            # Erst scharf schalten, dann die Anzeige nachziehen: ab `recording = True`
+            # laeuft Audio in die Queue. Was danach kommt, darf den Start nicht mehr
+            # aufhalten — und das Log zeigt so den echten Aufnahmebeginn.
             recording = True
             rec_start[0] = time.monotonic()
+            log.info("REC start")
             overlay_set("rec")
             set_tray("rec", f"Aufnahme · {MODE_SHORT.get(polish_mode, polish_mode)}")
-            log.info("REC start")
             return
         # STOP-Versuch:
         if time.monotonic() - rec_start[0] < MIN_REC_SEC:
@@ -2507,13 +2585,23 @@ def handle_toggle() -> None:
         samples = np.concatenate(chunks, axis=0).flatten()
         if samples.size < SAMPLE_RATE // 4:
             log.info("audio < 0.25s — silent skip"); overlay_set("idle"); return
+        # Erst Brummen raus, dann Auto-Gain: sonst verstaerkt der Gain die 50-Hz-Stoerung
+        # mit und der gemessene Peak stammt nicht von der Stimme.
+        # RMS statt Peak als Brumm-Mass: der Peak stammt bei normal lauter Stimme
+        # ohnehin von der Stimme und zeigt die entfernte Stoerenergie nicht an.
+        raw_rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+        samples = highpass(samples)
+        filt_rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+
         # Auto-Gain: sehr leise Aufnahmen (leises Sprechen, Mikro weit weg) anheben —
         # Whisper wird bei niedrigem Pegel merklich unsicherer. Peak landet im Log,
         # damit Mikro-Probleme diagnostizierbar sind.
         peak = float(np.max(np.abs(samples)))
         if 0.0 < peak < 0.30:
             samples = (samples * (0.85 / peak)).astype(np.float32)
-            log.info(f"audio peak {peak:.2f} -> auto-gain auf 0.85")
+            log.info(f"audio peak {peak:.3f} "
+                     f"(Hochpass entfernte {20 * np.log10(max(raw_rms, 1e-12) / max(filt_rms, 1e-12)):.1f} dB Stoerenergie) "
+                     f"-> auto-gain auf 0.85")
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
@@ -2674,6 +2762,7 @@ def main() -> None:
 
     build_overlay()
 
+    threading.Thread(target=ui_pusher, daemon=True).start()
     threading.Thread(target=run_tray, daemon=True).start()
     threading.Thread(target=audio_runner, daemon=True).start()
 

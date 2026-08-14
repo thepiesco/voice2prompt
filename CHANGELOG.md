@@ -2,6 +2,40 @@
 
 In Laiensprache: was hat sich am Sprache-zu-Text-Übersetzer geändert und warum.
 
+## 2026-08-14 – Die Aufnahme startet wieder sofort (das „wird immer langsamer"-Problem)
+
+Das Tool fühlte sich nach ein, zwei Tagen Laufzeit zäh an: Man drückte
+Strg+Leertaste, und es dauerte bis zu 5 Sekunden, bis die Aufnahme wirklich
+lief. In der Zwischenzeit drückte man verständlicherweise nochmal — und dann
+kam das Diktat durcheinander. Ein Neustart half, aber nur für etwa einen Tag.
+
+Die Ursache war nicht die Spracherkennung (die war die ganze Zeit bei 1-2
+Sekunden), sondern die Statusanzeige. Jedes Update an das kleine Fenster geht
+an Edge, und Edge antwortet mit zunehmender Laufzeit immer träger: Messung
+über 1.400 Diktate ergab 0,01 Sekunden in den ersten 8 Stunden, 0,3 Sekunden
+nach 20 Stunden und 1,2 Sekunden nach vier Tagen Dauerbetrieb. Weil das
+Programm die Anzeige aktualisierte, *bevor* es die Aufnahme scharf schaltete,
+wartete das Mikrofon jedes Mal auf Edge.
+
+Jetzt läuft es umgekehrt: Erst wird aufgenommen, die Anzeige zieht danach nach
+— und zwar über einen eigenen Kanal, der niemanden mehr aufhält. Gemessen nach
+dem Umbau: **1 Millisekunde** vom Tastendruck bis zum Aufnahmestart, statt
+bisher bis zu 5 Sekunden. Nebenbei behoben: Die Pegelanzeige der Wellenlinie
+hat bisher den Audio-Kanal blockiert, was Löcher in der Aufnahme reißen konnte.
+
+Edge wird weiterhin mit der Laufzeit langsamer — das merkt man jetzt nur
+nirgends mehr. Falls es doch einmal extrem wird, steht ab sofort ein Hinweis
+im Logbuch, statt dass man wieder beim Mikrofon sucht.
+
+## 2026-08-12 – Netzbrummen raus, bevor leise Aufnahmen lauter gedreht werden
+
+Der Klinken-Eingang fängt sich 50-Hz-Brummen aus dem Stromnetz ein (gemessen:
+79 % der Störleistung lagen unter 80 Hz). Wurde eine leise Aufnahme
+automatisch lauter gedreht, wurde das Brummen gleich mit verstärkt — teilweise
+stammte der gemessene Pegel gar nicht von der Stimme. Jetzt wird erst
+gefiltert, dann verstärkt. Sprache verliert dabei nichts: Unter 120 Hz trägt
+sie keine Information (Telefon überträgt seit jeher nur 300-3400 Hz).
+
 ## 2026-07-13 (4) – KI-Korrektur im Notfallmodus (nutzt den vorhandenen Anthropic-Key)
 
 Wer kein Groq-Konto anlegen will, bekommt jetzt trotzdem bessere Qualität,
